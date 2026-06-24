@@ -329,6 +329,13 @@ mod tests {
         RecoveredBlock::new_unhashed(EthBlock { header, body: Default::default() }, Vec::new())
     }
 
+    fn amsterdam_recovered_block_with_bal_hash(hash: B256) -> RecoveredBlock<EthBlock> {
+        let mut header = valid_prague_header();
+        header.block_access_list_hash = Some(hash);
+        header.slot_number = Some(0);
+        RecoveredBlock::new_unhashed(EthBlock { header, body: Default::default() }, Vec::new())
+    }
+
     #[test]
     fn test_valid_gas_limit_increase() {
         let parent = header_with_gas_limit(GAS_LIMIT_BOUND_DIVISOR * 10);
@@ -487,6 +494,36 @@ mod tests {
 
         assert!(FullConsensus::<EthPrimitives>::validate_block_post_execution(
             &consensus, &block, &result, None, None,
+        )
+        .is_ok());
+
+        assert!(matches!(
+            FullConsensus::<EthPrimitives>::validate_block_post_execution(
+                &consensus,
+                &block,
+                &result,
+                None,
+                Some(B256::repeat_byte(0x24)),
+            )
+            .unwrap_err(),
+            ConsensusError::BlockAccessListHashMismatch(_)
+        ));
+    }
+
+    #[test]
+    fn amsterdam_post_execution_compares_computed_block_access_list_hash() {
+        let chain_spec = Arc::new(ChainSpecBuilder::mainnet().amsterdam_activated().build());
+        let expected_hash = B256::repeat_byte(0x42);
+        let block = amsterdam_recovered_block_with_bal_hash(expected_hash);
+        let result = BlockExecutionResult::<Receipt>::default();
+        let consensus = EthBeaconConsensus::new(chain_spec);
+
+        assert!(FullConsensus::<EthPrimitives>::validate_block_post_execution(
+            &consensus,
+            &block,
+            &result,
+            None,
+            Some(expected_hash),
         )
         .is_ok());
 

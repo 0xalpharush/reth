@@ -91,7 +91,7 @@ use reth_revm::db::{states::bundle_state::BundleRetention, BundleAccount, State}
 use reth_trie::{trie_cursor::TrieCursorFactory, updates::TrieUpdates, HashedPostState};
 use reth_trie_db::ChangesetCache;
 use reth_trie_parallel::root::{ParallelStateRoot, ParallelStateRootError};
-use revm_primitives::{Address, KECCAK_EMPTY};
+use revm_primitives::{hardfork::SpecId, Address, KECCAK_EMPTY};
 use std::{
     collections::HashMap,
     panic::{self, AssertUnwindSafe},
@@ -473,6 +473,8 @@ where
         let evm_env = debug_span!(target: "engine::tree::payload_validator", "evm_env")
             .in_scope(|| self.evm_env_for(&input))
             .map_err(NewPayloadError::other)?;
+        let require_computed_bal_hash =
+            (*evm_env.spec_id()).into().is_enabled_in(SpecId::AMSTERDAM);
 
         // Extract the decoded BAL, if valid and available.
         let decoded_bal = ensure_ok!(input
@@ -677,7 +679,8 @@ where
                 &output,
                 &mut ctx,
                 receipt_root_bloom,
-                built_bal
+                built_bal,
+                require_computed_bal_hash,
             ),
             block
         );
@@ -1061,12 +1064,13 @@ where
     {
         debug!(target: "engine::tree::payload_validator", "Executing block");
 
-        let has_bal = env.decoded_bal.is_some();
+        let should_build_bal = env.decoded_bal.is_some() ||
+            (*env.evm_env.spec_id()).into().is_enabled_in(SpecId::AMSTERDAM);
         let mut db = debug_span!(target: "engine::tree", "build_state_db").in_scope(|| {
             State::builder()
                 .with_database(StateProviderDatabase::new(state_provider))
                 .with_bundle_update()
-                .with_bal_builder_if(has_bal)
+                .with_bal_builder_if(should_build_bal)
                 .build()
         });
 
@@ -1117,7 +1121,7 @@ where
             handle.iter_transactions(),
             &receipt_tx,
             &executed_tx_index,
-            has_bal,
+            should_build_bal,
         )?;
         drop(receipt_tx);
 
@@ -1132,7 +1136,7 @@ where
         debug_span!(target: "engine::tree", "merge_transitions")
             .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
 
-        let built_bal = if has_bal { db.take_built_alloy_bal() } else { None };
+        let built_bal = if should_build_bal { db.take_built_alloy_bal() } else { None };
         let output = BlockExecutionOutput { result, state: db.take_bundle() };
 
         let execution_duration = execution_start.elapsed();
@@ -1634,6 +1638,7 @@ where
         ctx: &mut TreeCtx<'_, N>,
         receipt_root_bloom: Option<ReceiptRootBloom>,
         built_bal: Option<BlockAccessList>,
+        require_computed_bal_hash: bool,
     ) -> Result<(), InsertBlockErrorKind>
     where
         V: PayloadValidator<T, Block = N::Block>,
@@ -1648,6 +1653,11 @@ where
                 .entered();
         let block_access_list_hash =
             built_bal.as_ref().map(|bal| compute_block_access_list_hash(bal));
+        if require_computed_bal_hash && block_access_list_hash.is_none() {
+            return Err(InsertBlockErrorKind::Other(
+                "Amsterdam block execution did not build a block access list".into(),
+            ))
+        }
 
         if let Err(err) = self.consensus.validate_block_post_execution(
             block,
