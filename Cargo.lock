@@ -9068,6 +9068,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-fuzz-harness"
+version = "2.3.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "bincode",
+ "serde",
+]
+
+[[package]]
 name = "reth-invalid-block-hooks"
 version = "2.3.0"
 dependencies = [
