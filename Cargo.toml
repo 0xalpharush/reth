@@ -148,6 +148,7 @@ members = [
     "examples/txpool-tracing/",
     "examples/custom-beacon-withdrawals",
     "testing/ef-tests/",
+    "testing/fuzz-harness",
     "testing/testing-utils",
     "testing/runner",
     "crates/tracing-otlp",
