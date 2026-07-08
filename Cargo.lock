@@ -8932,8 +8932,22 @@ version = "2.3.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rlp",
  "bincode",
- "revm",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-db-common",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-revm",
+ "reth-trie",
+ "reth-trie-db",
  "serde",
 ]
 
