@@ -17,5 +17,19 @@ workspace = true
 [dependencies]
 alloy-consensus = { workspace = true, features = ["secp256k1"] }
 alloy-eips.workspace = true
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
 bincode.workspace = true
+reth-chainspec.workspace = true
+reth-consensus.workspace = true
+reth-db-common.workspace = true
+reth-ethereum-consensus.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm = { workspace = true, features = ["blst", "c-kzg", "p256-aws-lc-rs"] }
+reth-evm-ethereum = { workspace = true, features = ["std", "blst", "c-kzg", "p256-aws-lc-rs"] }
+reth-primitives-traits = { workspace = true, features = ["rayon"] }
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-trie.workspace = true
+reth-trie-db.workspace = true
 serde = { workspace = true, features = ["derive"] }
