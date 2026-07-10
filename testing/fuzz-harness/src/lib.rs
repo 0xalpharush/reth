@@ -13,20 +13,20 @@ use alloy_eips::Decodable2718;
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, Bytes, B256, B64, U256};
 use alloy_rlp::Decodable;
-use reth_chainspec::{ChainSpec, ChainSpecBuilder};
+use reth_chainspec::{Chain, ChainSpec, ChainSpecBuilder};
 use reth_consensus::{Consensus, HeaderValidator};
 use reth_db_common::init::{insert_genesis_hashes, insert_genesis_history, insert_genesis_state};
 use reth_ethereum_consensus::{validate_block_post_execution, EthBeaconConsensus};
 use reth_ethereum_primitives::{Block as EthBlock, Receipt, TransactionSigned};
-use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_evm::{database::StateProviderDatabase, execute::Executor, ConfigureEvm};
 use reth_evm_ethereum::EthEvmConfig;
+use reth_execution_types::hashed_post_state_from_execution_state;
 use reth_primitives_traits::SealedHeader;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_provider::{
-    hashed_post_state_from_state_source, test_utils::create_test_provider_factory_with_chain_spec,
-    BlockWriter, DatabaseProviderFactory, ExecutionOutcome, HistoryWriter, OriginalValuesKnown,
-    SharedEvmStateProviderDatabase, StateWriteConfig, StateWriter, StaticFileProviderFactory,
-    StaticFileSegment, StaticFileWriter, StorageSettingsCache,
+    test_utils::create_test_provider_factory_with_chain_spec, BlockWriter, DatabaseProviderFactory,
+    ExecutionOutcome, HistoryWriter, OriginalValuesKnown, StateWriteConfig, StateWriter,
+    StaticFileProviderFactory, StaticFileSegment, StaticFileWriter, StorageSettingsCache,
 };
 use reth_trie::{KeccakKeyHasher, StateRoot};
 use reth_trie_db::DatabaseStateRoot;
@@ -37,7 +37,8 @@ use serde::{
 
 macro_rules! compute_state_root {
     ($provider:expr, $output:expr) => {{
-        let hashed_state = hashed_post_state_from_state_source::<KeccakKeyHasher, _>(&$output.state);
+        let hashed_state =
+            hashed_post_state_from_execution_state::<KeccakKeyHasher>($output.state.inner());
         let sorted = hashed_state.clone_into_sorted();
         reth_trie_db::with_adapter!($provider, |A| {
             StateRoot::<reth_trie_db::DatabaseTrieCursorFactory<_, A>, _>::overlay_root_with_updates(
@@ -449,7 +450,7 @@ fn execute_state(input: EthereumStateInput) -> Option<EthereumExecutionOutcome> 
         return None;
     }
     let tx = recover_tx(&input.tx)?;
-    let chain_spec = chain_spec(input.fork);
+    let chain_spec = chain_spec(input.chain_id, input.fork);
     let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
     let provider = factory.database_provider_rw().ok()?;
     let genesis_state = genesis_state(input.pre_state);
@@ -463,7 +464,7 @@ fn execute_state(input: EthereumStateInput) -> Option<EthereumExecutionOutcome> 
         block.body().transactions().map(|tx| tx.effective_gas_price(base_fee)).collect::<Vec<_>>();
     let executor_provider = EthEvmConfig::ethereum(chain_spec);
     let state_provider = provider.latest();
-    let database = unsafe { SharedEvmStateProviderDatabase::new(&state_provider) };
+    let database = StateProviderDatabase::new(&state_provider);
     let output = match executor_provider.executor(database).execute(&block) {
         Ok(output) => output,
         Err(_) => return Some(execution_error(ErrorClass::Rejected)),
@@ -486,7 +487,7 @@ fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutio
         return None;
     }
 
-    let chain_spec = chain_spec(input.fork);
+    let chain_spec = chain_spec(input.chain_id, input.fork);
     let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
     let provider = factory.database_provider_rw().ok()?;
 
@@ -534,7 +535,7 @@ fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutio
         }
 
         let state_provider = provider.latest();
-        let database = unsafe { SharedEvmStateProviderDatabase::new(&state_provider) };
+        let database = StateProviderDatabase::new(&state_provider);
         let output = match executor_provider.executor(database).execute(&block) {
             Ok(output) => output,
             Err(_) => {
@@ -574,7 +575,8 @@ fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutio
             &output.result.receipts,
             &effective_gas_prices,
         ));
-        let hashed_state = hashed_post_state_from_state_source::<KeccakKeyHasher, _>(&output.state);
+        let hashed_state =
+            hashed_post_state_from_execution_state::<KeccakKeyHasher>(output.state.inner());
         provider
             .write_state(
                 &ExecutionOutcome::single(block.number, output),
@@ -662,8 +664,8 @@ fn decode_recovered_block(bytes: &[u8]) -> Option<RecoveredBlock<EthBlock>> {
     SealedBlock::<EthBlock>::decode(&mut &bytes[..]).ok()?.try_recover().ok()
 }
 
-fn chain_spec(fork: EthFork) -> Arc<ChainSpec> {
-    let spec = ChainSpecBuilder::mainnet().reset();
+fn chain_spec(chain_id: u64, fork: EthFork) -> Arc<ChainSpec> {
+    let spec = ChainSpecBuilder::mainnet().reset().chain(Chain::from_id(chain_id));
     let spec = match fork {
         EthFork::Frontier => spec.frontier_activated(),
         EthFork::Homestead => spec.homestead_activated(),
@@ -874,6 +876,12 @@ mod tests {
                 HarnessInputKind::Blockchain,
             ]
         );
+    }
+
+    #[test]
+    fn chain_spec_uses_input_chain_id() {
+        let spec = chain_spec(42431, EthFork::Cancun);
+        assert_eq!(spec.chain.id(), 42431);
     }
 
     #[test]

@@ -28,6 +28,7 @@ reth-ethereum-consensus.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-evm = { workspace = true, features = ["blst", "c-kzg", "p256-aws-lc-rs"] }
 reth-evm-ethereum = { workspace = true, features = ["std", "blst", "c-kzg", "p256-aws-lc-rs"] }
+reth-execution-types.workspace = true
 reth-primitives-traits = { workspace = true, features = ["rayon"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-trie.workspace = true
