@@ -13,10 +13,9 @@ use alloc::{
     vec::Vec,
 };
 #[cfg(test)]
-use alloy_consensus::transaction::Recovered;
-#[cfg(test)]
-use alloy_consensus::TxType;
-use alloy_consensus::{constants::ETH_TO_WEI, transaction::Transaction, BlockHeader, Header};
+use alloy_consensus::{constants::ETH_TO_WEI, transaction::Recovered, TxType};
+use alloy_consensus::{transaction::Transaction, BlockHeader, Header};
+use alloy_evm::block::calc::{block_reward, ommer_reward};
 #[cfg(test)]
 use alloy_eips::eip2718::Typed2718;
 use alloy_eips::{
@@ -331,6 +330,7 @@ pub(crate) struct BlockExecutionInput<'a, DB> {
     block_env: BlockEnv,
     database: DB,
     block_number: u64,
+    base_block_reward: Option<u128>,
     context: BlockExecutionContext<'a>,
     precompiles: Box<dyn PrecompileProvider<BaseEvmTypes>>,
 }
@@ -346,7 +346,21 @@ impl<'a, DB> BlockExecutionInput<'a, DB> {
         context: BlockExecutionContext<'a>,
         precompiles: Box<dyn PrecompileProvider<BaseEvmTypes>>,
     ) -> Self {
-        Self { spec_id, block_env, database, block_number, context, precompiles }
+        Self {
+            spec_id,
+            block_env,
+            database,
+            block_number,
+            base_block_reward: None,
+            context,
+            precompiles,
+        }
+    }
+
+    /// Overrides the base block reward applied after transaction execution.
+    pub(crate) const fn with_base_block_reward(mut self, base_block_reward: Option<u128>) -> Self {
+        self.base_block_reward = base_block_reward;
+        self
     }
 }
 
@@ -390,7 +404,15 @@ where
         R: for<'receipt> FnMut(usize, &'receipt Receipt) -> Result<(), ReceiptErr>,
         H: FnMut(HashedPostState),
     {
-        let Self { spec_id, block_env, database, block_number, context, precompiles } = self;
+        let Self {
+            spec_id,
+            block_env,
+            database,
+            block_number,
+            base_block_reward,
+            context,
+            precompiles,
+        } = self;
         let ExecutionHooks {
             mut on_transaction_executed,
             mut on_receipt,
@@ -463,7 +485,7 @@ where
             &mut block_state,
             hashed_state_mode.stream(),
             &mut on_hashed_state_update,
-            spec_id,
+            base_block_reward,
             block_number,
             block_beneficiary,
             context.ommers,
@@ -989,7 +1011,7 @@ pub(crate) fn post_block_balance_state_changes(
     block_state: &mut BlockStateAccumulator,
     stream_hashed_state: bool,
     on_hashed_state_update: &mut impl FnMut(HashedPostState),
-    spec_id: SpecId,
+    base_block_reward: Option<u128>,
     block_number: u64,
     block_beneficiary: Address,
     ommers: Option<&[Header]>,
@@ -997,7 +1019,7 @@ pub(crate) fn post_block_balance_state_changes(
 ) -> Result<(), EthExecutionError> {
     let mut balance_increments = AddressMap::<U256>::default();
 
-    if let Some(base_block_reward) = base_block_reward(spec_id) {
+    if let Some(base_block_reward) = base_block_reward {
         let ommers = ommers.unwrap_or_default();
         for ommer in ommers {
             *balance_increments.entry(ommer.beneficiary()).or_default() +=
@@ -1032,27 +1054,6 @@ pub(crate) fn post_block_balance_state_changes(
     commit_state_changes(evm, block_state, stream_hashed_state, on_hashed_state_update, &changes);
 
     Ok(())
-}
-
-const fn base_block_reward(spec_id: SpecId) -> Option<u128> {
-    if spec_id.enables(SpecId::MERGE) {
-        None
-    } else if spec_id.enables(SpecId::PETERSBURG) {
-        Some(ETH_TO_WEI * 2)
-    } else if spec_id.enables(SpecId::BYZANTIUM) {
-        Some(ETH_TO_WEI * 3)
-    } else {
-        Some(ETH_TO_WEI * 5)
-    }
-}
-
-const fn block_reward(base_block_reward: u128, ommers: usize) -> u128 {
-    base_block_reward + (base_block_reward >> 5) * ommers as u128
-}
-
-fn ommer_reward(base_block_reward: u128, block_number: u64, ommer_block_number: u64) -> u128 {
-    let distance = 8u64.saturating_add(ommer_block_number).saturating_sub(block_number);
-    (u128::from(distance) * base_block_reward) >> 3
 }
 
 const fn empty_account() -> AccountInfo {
@@ -1184,13 +1185,16 @@ mod tests {
     fn constantinople_reward_uses_two_eth_despite_byzantium_evm_spec() {
         let beneficiary = address!("0000000000000000000000000000000000001000");
 
-        let output = execute_block(
+        let output = BlockExecutionInput::new(
             SpecId::BYZANTIUM,
             BlockEnv { beneficiary, ..Default::default() },
-            TestDatabase::default(),
+            Db::new(TestDatabase::default()),
             7,
-            core::iter::empty::<Recovered<TransactionSigned>>(),
+            BlockExecutionContext::default(),
+            Box::new(Precompiles::base(SpecId::BYZANTIUM)),
         )
+        .with_base_block_reward(Some(ETH_TO_WEI * 2))
+        .execute_recovered_transactions(core::iter::empty::<Recovered<TransactionSigned>>())
         .expect("EVM execution succeeds");
 
         assert_eq!(

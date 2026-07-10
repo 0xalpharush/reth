@@ -1,8 +1,10 @@
 #[cfg(feature = "jit")]
 use alloc::string::String;
 use alloc::{boxed::Box, sync::Arc};
+use alloy_evm::block::calc::base_block_reward as alloy_base_block_reward;
 use alloy_consensus::Header;
-use reth_chainspec::{ChainSpec, EthChainSpec};
+use evm2::interpreter::Host;
+use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 #[cfg(feature = "std")]
 use reth_evm::precompile_cache::{CachedPrecompileProvider, PrecompileCacheMap};
 
@@ -105,7 +107,7 @@ impl<C, EvmFactory> EthBlockExecutorFactory<C, EvmFactory> {
         ctx: EthBlockExecutionCtx<'a>,
     ) -> EthBlockExecutor<'a>
     where
-        C: EthChainSpec<Header = Header>,
+        C: EthChainSpec<Header = Header> + EthereumHardforks,
     {
         self.create_executor_with_hashed_state_mode(evm, ctx, HashedStateMode::OutputOnly)
     }
@@ -113,18 +115,22 @@ impl<C, EvmFactory> EthBlockExecutorFactory<C, EvmFactory> {
     /// Creates a configured Ethereum block executor with an explicit hashed-state output mode.
     pub(crate) fn create_executor_with_hashed_state_mode<'a>(
         &'a self,
-        evm: evm2::Evm<'a, evm2::BaseEvmTypes>,
+        mut evm: evm2::Evm<'a, evm2::BaseEvmTypes>,
         ctx: EthBlockExecutionCtx<'a>,
         hashed_state_mode: HashedStateMode,
     ) -> EthBlockExecutor<'a>
     where
-        C: EthChainSpec<Header = Header>,
+        C: EthChainSpec<Header = Header> + EthereumHardforks,
     {
+        let block_number = evm.block_env().number.to::<u64>();
+        let base_block_reward = alloy_base_block_reward(self.chain_spec.as_ref(), block_number);
+
         EthBlockExecutor::new(
             evm,
             ctx,
             self.chain_spec.chain_id(),
             self.chain_spec.deposit_contract().map(|contract| contract.address),
+            base_block_reward,
             hashed_state_mode,
         )
     }
@@ -181,7 +187,7 @@ impl<C, EvmFactory> EthBlockExecutorFactory<C, EvmFactory> {
 
 impl<C, EvmFactory> reth_evm::BlockExecutorFactory for EthBlockExecutorFactory<C, EvmFactory>
 where
-    C: EthChainSpec<Header = Header>,
+    C: EthChainSpec<Header = Header> + EthereumHardforks,
     EvmFactory: 'static,
 {
     type Primitives = EthPrimitives;

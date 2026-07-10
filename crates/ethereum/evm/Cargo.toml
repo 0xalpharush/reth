@@ -27,6 +27,7 @@ evm2-jit = { workspace = true, optional = true, features = ["llvm"] }
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
 alloy-consensus.workspace = true
+alloy-evm.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-sol-types.workspace = true
 

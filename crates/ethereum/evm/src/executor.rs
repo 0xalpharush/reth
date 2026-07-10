@@ -28,6 +28,7 @@ pub struct EthBlockExecutor<'a> {
     spec_id: evm2::SpecId,
     block_number: u64,
     block_beneficiary: Address,
+    base_block_reward: Option<u128>,
     parent_hash: B256,
     parent_beacon_block_root: Option<B256>,
     ommers: &'a [Header],
@@ -67,6 +68,7 @@ impl<'a> EthBlockExecutor<'a> {
         context: EthBlockExecutionCtx<'a>,
         chain_id: u64,
         deposit_contract_address: Option<alloy_primitives::Address>,
+        base_block_reward: Option<u128>,
         hashed_state_mode: HashedStateMode,
     ) -> Self {
         let spec_id = evm.spec_id();
@@ -79,6 +81,7 @@ impl<'a> EthBlockExecutor<'a> {
             spec_id,
             block_number,
             block_beneficiary,
+            base_block_reward,
             parent_hash: context.parent_hash,
             parent_beacon_block_root: context.parent_beacon_block_root,
             ommers: context.ommers,
@@ -230,7 +233,7 @@ impl<'a> BlockExecutor for EthBlockExecutor<'a> {
             &mut self.block_state,
             self.hashed_state_mode.stream(),
             &mut |state| emit_hashed_state(&mut self.hashed_state_update_hook, state),
-            self.spec_id,
+            self.base_block_reward,
             self.block_number,
             self.block_beneficiary,
             context.ommers,
