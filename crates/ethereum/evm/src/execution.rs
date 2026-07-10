@@ -1181,6 +1181,25 @@ mod tests {
     }
 
     #[test]
+    fn constantinople_reward_uses_two_eth_despite_byzantium_evm_spec() {
+        let beneficiary = address!("0000000000000000000000000000000000001000");
+
+        let output = execute_block(
+            SpecId::BYZANTIUM,
+            BlockEnv { beneficiary, ..Default::default() },
+            TestDatabase::default(),
+            7,
+            core::iter::empty::<Recovered<TransactionSigned>>(),
+        )
+        .expect("EVM execution succeeds");
+
+        assert_eq!(
+            output.account_state(&beneficiary).unwrap().current.as_ref().unwrap().balance,
+            U256::from(ETH_TO_WEI * 2)
+        );
+    }
+
+    #[test]
     fn fallible_transaction_stream_is_consumed_lazily() {
         let caller = address!("0000000000000000000000000000000000000001");
         let target = address!("0000000000000000000000000000000000001000");
