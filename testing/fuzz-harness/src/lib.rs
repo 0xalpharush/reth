@@ -13,7 +13,7 @@ use alloy_eips::Decodable2718;
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, Bytes, B256, B64, U256};
 use alloy_rlp::Decodable;
-use reth_chainspec::{ChainSpec, ChainSpecBuilder};
+use reth_chainspec::{Chain, ChainSpec, ChainSpecBuilder};
 use reth_consensus::{Consensus, HeaderValidator};
 use reth_db_common::init::{insert_genesis_hashes, insert_genesis_history, insert_genesis_state};
 use reth_ethereum_consensus::{validate_block_post_execution, EthBeaconConsensus};
@@ -451,7 +451,9 @@ fn execute_state(input: EthereumStateInput) -> Option<EthereumExecutionOutcome> 
         return None;
     }
     let tx = recover_tx(&input.tx)?;
-    let chain_spec = chain_spec(input.fork);
+    let diagnostic_addresses =
+        state_diagnostic_addresses(&input.pre_state, input.env.beneficiary, &tx);
+    let chain_spec = chain_spec(input.chain_id, input.fork);
     let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
     let provider = factory.database_provider_rw().ok()?;
     let genesis_state = genesis_state(input.pre_state);
@@ -471,13 +473,16 @@ fn execute_state(input: EthereumStateInput) -> Option<EthereumExecutionOutcome> 
         Err(_) => return Some(execution_error(ErrorClass::Rejected)),
     };
     let state_root = compute_state_root!(provider, output)?;
-    Some(execution_outcome(
+    let state_diff = diagnostic_state_diff(&output, &diagnostic_addresses);
+    let mut outcome = execution_outcome(
         ErrorClass::None,
         0,
         &output.result.receipts,
         &effective_gas_prices,
         Some(state_root),
-    ))
+    );
+    outcome.state_diff = state_diff;
+    Some(outcome)
 }
 
 fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutionOutcome> {
@@ -488,7 +493,7 @@ fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutio
         return None;
     }
 
-    let chain_spec = chain_spec(input.fork);
+    let chain_spec = chain_spec(input.chain_id, input.fork);
     let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
     let provider = factory.database_provider_rw().ok()?;
 
@@ -665,8 +670,8 @@ fn decode_recovered_block(bytes: &[u8]) -> Option<RecoveredBlock<EthBlock>> {
     SealedBlock::<EthBlock>::decode(&mut &bytes[..]).ok()?.try_recover().ok()
 }
 
-fn chain_spec(fork: EthFork) -> Arc<ChainSpec> {
-    let spec = ChainSpecBuilder::mainnet().reset();
+fn chain_spec(chain_id: u64, fork: EthFork) -> Arc<ChainSpec> {
+    let spec = ChainSpecBuilder::mainnet().reset().chain(Chain::from_id(chain_id));
     let spec = match fork {
         EthFork::Frontier => spec.frontier_activated(),
         EthFork::Homestead => spec.homestead_activated(),
@@ -796,6 +801,51 @@ fn execution_outcome(
     }
 }
 
+fn state_diagnostic_addresses(
+    pre_state: &StateInput,
+    beneficiary: [u8; 20],
+    tx: &Recovered<TransactionSigned>,
+) -> Vec<Address> {
+    let mut addresses = Vec::new();
+    addresses.push(tx.signer());
+    addresses.push(Address::new(beneficiary));
+    addresses.push(Address::ZERO);
+    if let Some(to) = tx.to() {
+        addresses.push(to);
+    }
+    addresses.extend(pre_state.accounts.iter().map(|account| Address::new(account.address)));
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+fn diagnostic_state_diff<T>(
+    output: &reth_evm::execute::BlockExecutionOutput<T>,
+    addresses: &[Address],
+) -> StateDiff {
+    let mut accounts = Vec::new();
+    for address in addresses {
+        let Some(account) = output.account(address) else {
+            continue;
+        };
+        let (balance, nonce, code) = match account {
+            Some(account) => {
+                let code = account.bytecode_hash.and_then(|hash| {
+                    output.bytecode(&hash).map(|bytecode| bytecode.bytes_ref().to_vec())
+                });
+                (Some(u256_to_array(account.balance)), Some(account.nonce), code)
+            }
+            None => (Some([0u8; 32]), Some(0), Some(Vec::new())),
+        };
+        accounts.push(AccountDiff { address: address.into_array(), balance, nonce, code });
+    }
+    StateDiff { accounts, storage: Vec::new(), txs: Vec::new() }
+}
+
+fn u256_to_array(value: U256) -> [u8; 32] {
+    value.to_be_bytes::<32>()
+}
+
 fn b256_to_array(value: B256) -> [u8; 32] {
     value.0
 }
@@ -877,6 +927,12 @@ mod tests {
                 HarnessInputKind::Blockchain,
             ]
         );
+    }
+
+    #[test]
+    fn chain_spec_uses_input_chain_id() {
+        let spec = chain_spec(42431, EthFork::Cancun);
+        assert_eq!(spec.chain.id(), 42431);
     }
 
     #[test]
