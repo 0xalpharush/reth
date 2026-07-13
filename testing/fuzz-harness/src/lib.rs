@@ -450,6 +450,8 @@ fn execute_state(input: EthereumStateInput) -> Option<EthereumExecutionOutcome> 
         return None;
     }
     let tx = recover_tx(&input.tx)?;
+    let diagnostic_addresses =
+        state_diagnostic_addresses(&input.pre_state, input.env.beneficiary, &tx);
     let chain_spec = chain_spec(input.chain_id, input.fork);
     let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
     let provider = factory.database_provider_rw().ok()?;
@@ -470,13 +472,16 @@ fn execute_state(input: EthereumStateInput) -> Option<EthereumExecutionOutcome> 
         Err(_) => return Some(execution_error(ErrorClass::Rejected)),
     };
     let state_root = compute_state_root!(provider, output)?;
-    Some(execution_outcome(
+    let state_diff = diagnostic_state_diff(&output, &diagnostic_addresses);
+    let mut outcome = execution_outcome(
         ErrorClass::None,
         0,
         &output.result.receipts,
         &effective_gas_prices,
         Some(state_root),
-    ))
+    );
+    outcome.state_diff = state_diff;
+    Some(outcome)
 }
 
 fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutionOutcome> {
@@ -793,6 +798,51 @@ fn execution_outcome(
         state_diff: StateDiff::default(),
         invariant_failures: Vec::new(),
     }
+}
+
+fn state_diagnostic_addresses(
+    pre_state: &StateInput,
+    beneficiary: [u8; 20],
+    tx: &Recovered<TransactionSigned>,
+) -> Vec<Address> {
+    let mut addresses = Vec::new();
+    addresses.push(tx.signer());
+    addresses.push(Address::new(beneficiary));
+    addresses.push(Address::ZERO);
+    if let Some(to) = tx.to() {
+        addresses.push(to);
+    }
+    addresses.extend(pre_state.accounts.iter().map(|account| Address::new(account.address)));
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
+fn diagnostic_state_diff<T>(
+    output: &reth_evm::execute::BlockExecutionOutput<T>,
+    addresses: &[Address],
+) -> StateDiff {
+    let mut accounts = Vec::new();
+    for address in addresses {
+        let Some(account) = output.account(address) else {
+            continue;
+        };
+        let (balance, nonce, code) = match account {
+            Some(account) => {
+                let code = account.bytecode_hash.and_then(|hash| {
+                    output.bytecode(&hash).map(|bytecode| bytecode.bytes_ref().to_vec())
+                });
+                (Some(u256_to_array(account.balance)), Some(account.nonce), code)
+            }
+            None => (Some([0u8; 32]), Some(0), Some(Vec::new())),
+        };
+        accounts.push(AccountDiff { address: address.into_array(), balance, nonce, code });
+    }
+    StateDiff { accounts, storage: Vec::new(), txs: Vec::new() }
+}
+
+fn u256_to_array(value: U256) -> [u8; 32] {
+    value.to_be_bytes::<32>()
 }
 
 fn b256_to_array(value: B256) -> [u8; 32] {
