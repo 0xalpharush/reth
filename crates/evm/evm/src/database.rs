@@ -164,8 +164,13 @@ where
     }
 
     fn get_block_hash(&mut self, number: &Word) -> Result<Option<B256>, Self::Error> {
-        self.0.block_hash(u256_to_u64_saturating(*number))
+        Ok(normalize_provider_block_hash(self.0.block_hash(u256_to_u64_saturating(*number))?))
     }
+}
+
+#[cfg(feature = "std")]
+fn normalize_provider_block_hash(hash: Option<B256>) -> Option<B256> {
+    Some(hash.unwrap_or_default())
 }
 
 #[cfg(feature = "std")]
@@ -185,5 +190,17 @@ fn u256_to_u64_saturating(value: U256) -> BlockNumber {
         u64::MAX
     } else {
         value.to()
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_provider_block_hash_matches_revm_zero_hash_adapter() {
+        assert_eq!(normalize_provider_block_hash(None), Some(B256::ZERO));
+        let hash = B256::with_last_byte(1);
+        assert_eq!(normalize_provider_block_hash(Some(hash)), Some(hash));
     }
 }
