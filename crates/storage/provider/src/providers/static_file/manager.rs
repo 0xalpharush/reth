@@ -651,8 +651,8 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         // Propagate tracing context into rayon-spawned threads so that per-segment
         // write spans appear as children of write_blocks_data in traces.
         let span = tracing::Span::current();
-        runtime.storage_pool().in_place_scope(|s| {
-            s.spawn(|_| {
+        reth_rayon::in_place_scope(runtime.storage_pool(), |s| {
+            s.spawn(|| {
                 let _guard = span.enter();
                 r_headers =
                     Some(self.write_segment(StaticFileSegment::Headers, first_block_number, |w| {
@@ -660,7 +660,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     }));
             });
 
-            s.spawn(|_| {
+            s.spawn(|| {
                 let _guard = span.enter();
                 r_txs = Some(self.write_segment(
                     StaticFileSegment::Transactions,
@@ -670,7 +670,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             });
 
             if ctx.write_senders {
-                s.spawn(|_| {
+                s.spawn(|| {
                     let _guard = span.enter();
                     r_senders = Some(self.write_segment(
                         StaticFileSegment::TransactionSenders,
@@ -681,7 +681,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             }
 
             if ctx.write_receipts {
-                s.spawn(|_| {
+                s.spawn(|| {
                     let _guard = span.enter();
                     r_receipts = Some(self.write_segment(
                         StaticFileSegment::Receipts,
@@ -692,7 +692,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             }
 
             if ctx.write_account_changesets {
-                s.spawn(|_| {
+                s.spawn(|| {
                     let _guard = span.enter();
                     r_account_changesets = Some(self.write_segment(
                         StaticFileSegment::AccountChangeSets,
@@ -703,7 +703,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             }
 
             if ctx.write_storage_changesets {
-                s.spawn(|_| {
+                s.spawn(|| {
                     let _guard = span.enter();
                     r_storage_changesets = Some(self.write_segment(
                         StaticFileSegment::StorageChangeSets,
@@ -2834,9 +2834,9 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Tra
 
             let manager = self.clone();
 
-            // Spawn the task onto the global rayon pool
+            // Dispatch the independent chunk through the parallel execution context
             // This task will send the cached transaction hash through the channel.
-            rayon::spawn(move || {
+            reth_rayon::spawn(move || {
                 let _ = manager.fetch_range_with_predicate(
                     StaticFileSegment::Transactions,
                     chunk_range,
