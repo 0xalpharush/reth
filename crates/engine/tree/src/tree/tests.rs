@@ -45,10 +45,6 @@ use std::{
 use tokio::sync::oneshot;
 
 mod deterministic;
-mod native_validation;
-mod node;
-mod node_storage;
-mod node_wire;
 
 /// Wraps blocks as if they had been downloaded without any access list data.
 fn downloaded_blocks<B: reth_primitives_traits::Block>(

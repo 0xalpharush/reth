@@ -3928,23 +3928,17 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
 
             let start = Instant::now();
             self.static_file_provider.finalize()?;
-            #[cfg(test)]
-            tests::crash_cut::after_commit_step("static_files");
             timings.sf = start.elapsed();
 
             let start = Instant::now();
             let batches = std::mem::take(&mut *self.pending_rocksdb_batches.lock());
             for batch in batches {
                 self.rocksdb_provider.commit_batch(batch)?;
-                #[cfg(test)]
-                tests::crash_cut::after_commit_step("rocksdb");
             }
             timings.rocksdb = start.elapsed();
 
             let start = Instant::now();
             self.tx.commit()?;
-            #[cfg(test)]
-            tests::crash_cut::after_commit_step("mdbx");
             timings.mdbx = start.elapsed();
 
             self.metrics.record_commit(&timings);
@@ -3989,8 +3983,6 @@ impl<TX: Send, N: NodeTypes> StoragePath for DatabaseProvider<TX, N> {
 
 #[cfg(test)]
 mod tests {
-    pub(super) mod crash_cut;
-
     use super::*;
     use crate::{
         test_utils::{blocks::BlockchainTestData, create_test_provider_factory},

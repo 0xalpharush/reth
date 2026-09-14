@@ -270,7 +270,7 @@ where
             }
         };
         ctx.metrics.execution_duration.record(start.elapsed());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "dst"))]
         if let Some(transactions) = &ctx.cooperative_transactions {
             transactions.fetch_add(1, Ordering::Relaxed);
         }
@@ -775,7 +775,7 @@ where
     /// Whether BAL state prefetching during prewarm is disabled.
     pub disable_bal_batch_io: bool,
     /// Optional observer for successful speculative execution on a cooperative runtime.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "dst"))]
     pub(crate) cooperative_transactions: Option<Arc<AtomicUsize>>,
 }
 
