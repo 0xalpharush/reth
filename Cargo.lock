@@ -9199,7 +9199,7 @@ dependencies = [
 
 [[package]]
 name = "reth-fuzz-harness"
-version = "2.3.0"
+version = "2.5.2"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
