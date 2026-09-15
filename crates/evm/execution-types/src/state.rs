@@ -8,8 +8,8 @@ use core::{convert::Infallible, marker::PhantomData};
 use evm2::{
     bytecode::Bytecode as ExecutableBytecode,
     evm::{
-        AccountChangeRef, AccountInfo, AccountInfoRef, BlockStateAccumulator, StateChangeSink,
-        StateChangeSource, StorageChange,
+        AccountChangeRef, AccountInfo, BlockStateAccumulator, StateChangeSink, StateChangeSource,
+        StorageChange,
     },
 };
 use reth_primitives_traits::{Account, Bytecode as RethBytecode};
@@ -71,13 +71,13 @@ impl From<AccountInfo> for RevertAccount {
     }
 }
 
-impl From<AccountInfoRef<'_>> for RevertAccount {
-    fn from(value: AccountInfoRef<'_>) -> Self {
+impl From<&AccountInfo> for RevertAccount {
+    fn from(value: &AccountInfo) -> Self {
         Self {
             balance: value.balance,
             nonce: value.nonce,
             code_hash: value.code_hash,
-            code: value.code.cloned(),
+            code: value.code.clone(),
         }
     }
 }
@@ -114,7 +114,38 @@ pub struct StorageReverts {
     /// Whether earlier aggregate state had already marked this account storage as wiped.
     pub previous_wipe: bool,
     /// Original storage slots before the block changed them.
-    pub slots: alloc::collections::BTreeMap<U256, U256>,
+    pub slots: alloc::collections::BTreeMap<U256, RevertToSlot>,
+}
+
+/// Storage revert value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RevertToSlot {
+    /// Revert the slot to the previous value observed by the transaction.
+    Some(U256),
+    /// The slot belonged to storage that was destroyed during the block.
+    ///
+    /// The transaction-local original value is not reliable in this case because the account may
+    /// have been recreated at the same address and the slot may never have loaded its pre-block
+    /// value. Storage writers resolve this marker from the pre-wipe database state.
+    Destroyed,
+}
+
+impl Default for RevertToSlot {
+    fn default() -> Self {
+        Self::Some(U256::ZERO)
+    }
+}
+
+impl RevertToSlot {
+    /// Returns the previous value represented by this revert when no wiped database value is
+    /// available.
+    pub const fn to_previous_value(self) -> U256 {
+        match self {
+            Self::Some(value) => value,
+            Self::Destroyed => U256::ZERO,
+        }
+    }
 }
 
 /// Returns the hashed post-state represented by an execution state.
@@ -148,11 +179,15 @@ pub fn execution_state_from_init(
 ) -> BlockStateAccumulator {
     let mut accumulator = BlockStateAccumulator::new();
     for (address, (original, current, storage)) in accounts {
+        let original_info = original.as_ref().map(account_ref_to_info_ref);
+        let current_info = current.as_ref().map(account_ref_to_info_ref);
         accumulator
             .account(AccountChangeRef {
                 address,
-                original: original.as_ref().map(account_ref_to_info_ref),
-                current: current.as_ref().map(account_ref_to_info_ref),
+                original: original_info.as_ref(),
+                current: current_info.as_ref(),
+                created: false,
+                selfdestructed: false,
             })
             .expect("infallible");
         for (slot, (original, current)) in storage {
@@ -278,7 +313,7 @@ impl StateAndRevertsSink<'_> {
             revert.wiped = true;
             revert.previous_wipe = previous_wipe;
             for (key, value) in prior_slots {
-                revert.slots.entry(key).or_insert(value);
+                revert.slots.entry(key).or_insert(RevertToSlot::Some(value));
             }
         }
         self.accumulator.storage_wipe(address)
@@ -293,13 +328,14 @@ impl StateChangeSink for StateAndRevertsSink<'_> {
     }
 
     fn account(&mut self, change: AccountChangeRef<'_>) -> Result<(), Self::Error> {
-        let deletes_pre_aggregate_account = change.deleted() &&
+        let deletes_account = change.current.is_none();
+        let deletes_pre_aggregate_account = deletes_account &&
             self.accumulator
                 .accounts()
                 .find(|(address, _)| *address == change.address)
                 .is_none_or(|(_, account)| account.original.is_some());
         self.reverts.account(change)?;
-        if change.deleted() && !self.block_wipes.contains(&change.address) {
+        if deletes_account && !self.block_wipes.contains(&change.address) {
             self.record_storage_wipe(change.address)?;
         }
         self.accumulator.account(change)?;
@@ -382,13 +418,13 @@ impl StateChangeSink for BlockRevertsSink {
     }
 
     fn storage(&mut self, change: StorageChange) -> Result<(), Self::Error> {
-        self.reverts
-            .storage
-            .entry(change.address)
-            .or_default()
-            .slots
-            .entry(change.key)
-            .or_insert(change.original);
+        let revert = self.reverts.storage.entry(change.address).or_default();
+        let previous = if revert.wiped {
+            RevertToSlot::Destroyed
+        } else {
+            RevertToSlot::Some(change.original)
+        };
+        revert.slots.entry(change.key).or_insert(previous);
         Ok(())
     }
 }
@@ -483,16 +519,17 @@ where
         Ok(())
     }
 }
-fn account_info_ref_to_reth(info: AccountInfoRef<'_>) -> Account {
+fn account_info_ref_to_reth(info: &AccountInfo) -> Account {
     account_parts_to_reth(info.nonce, info.balance, info.code_hash)
 }
 
-fn account_ref_to_info_ref(account: &Account) -> AccountInfoRef<'_> {
-    AccountInfoRef {
+fn account_ref_to_info_ref(account: &Account) -> AccountInfo {
+    AccountInfo {
         balance: account.balance,
         nonce: account.nonce,
         code_hash: account.get_bytecode_hash(),
         code: None,
+        _non_exhaustive: (),
     }
 }
 
@@ -505,30 +542,33 @@ fn account_parts_to_reth(nonce: u64, balance: alloy_primitives::U256, code_hash:
 mod tests {
     use super::*;
     use alloy_primitives::{Address, U256};
-    use evm2::evm::{AccountChangeRef, AccountInfoRef, StorageChange, Tee};
+    use evm2::evm::{AccountChangeRef, StorageChange, Tee};
     use reth_trie_common::KeccakKeyHasher;
 
-    #[test]
-    fn revert_account_normalizes_empty_code_hashes() {
-        for code_hash in [B256::ZERO, KECCAK_EMPTY] {
-            let account = RevertAccount { code_hash, ..Default::default() };
-            assert_eq!(Account::from(&account).bytecode_hash, None);
-        }
+    const fn account_change<'a>(
+        address: Address,
+        original: Option<&'a AccountInfo>,
+        current: Option<&'a AccountInfo>,
+    ) -> AccountChangeRef<'a> {
+        AccountChangeRef { address, original, current, created: false, selfdestructed: false }
+    }
 
-        let code_hash = B256::repeat_byte(0x42);
-        let account = RevertAccount { code_hash, ..Default::default() };
-        assert_eq!(Account::from(&account).bytecode_hash, Some(code_hash));
+    fn account_info(balance: u64) -> AccountInfo {
+        AccountInfo {
+            balance: U256::from(balance),
+            nonce: 1,
+            code_hash: B256::ZERO,
+            code: None,
+            _non_exhaustive: (),
+        }
     }
 
     #[test]
     fn deleted_account_preserves_storage_wipe_when_state_is_extended() {
         let address = Address::repeat_byte(0x01);
-        let original =
-            AccountInfoRef { balance: U256::from(1), nonce: 1, code_hash: B256::ZERO, code: None };
+        let original = account_info(1);
         let mut source = BlockStateAccumulator::new();
-        source
-            .account(AccountChangeRef { address, original: Some(original), current: None })
-            .unwrap();
+        source.account(account_change(address, Some(&original), None)).unwrap();
         let mut aggregate = BlockStateAccumulator::new();
 
         let reverts = extend_state_and_collect_reverts(&mut aggregate, &source);
@@ -538,18 +578,35 @@ mod tests {
     }
 
     #[test]
+    fn storage_written_after_wipe_is_marked_destroyed() {
+        let address = Address::repeat_byte(0x04);
+        let key = U256::from(1);
+        let mut source = BlockStateAccumulator::new();
+        source.storage_wipe(address).unwrap();
+        StateChangeSink::storage(
+            &mut source,
+            StorageChange { address, key, original: U256::ZERO, current: U256::from(1) },
+        )
+        .unwrap();
+
+        let mut aggregate = BlockStateAccumulator::new();
+        let reverts = extend_state_and_collect_reverts(&mut aggregate, &source);
+
+        assert_eq!(
+            reverts.storage[&address].slots[&key],
+            RevertToSlot::Destroyed,
+            "a post-wipe write must not use the recreated account's zero as the block revert"
+        );
+    }
+
+    #[test]
     fn account_created_and_deleted_across_blocks_does_not_retain_aggregate_wipe() {
         let address = Address::repeat_byte(0x03);
-        let account =
-            AccountInfoRef { balance: U256::from(1), nonce: 1, code_hash: B256::ZERO, code: None };
+        let account = account_info(1);
         let mut creation = BlockStateAccumulator::new();
-        creation
-            .account(AccountChangeRef { address, original: None, current: Some(account) })
-            .unwrap();
+        creation.account(account_change(address, None, Some(&account))).unwrap();
         let mut deletion = BlockStateAccumulator::new();
-        deletion
-            .account(AccountChangeRef { address, original: Some(account), current: None })
-            .unwrap();
+        deletion.account(account_change(address, Some(&account), None)).unwrap();
         let mut aggregate = BlockStateAccumulator::new();
 
         extend_state_and_collect_reverts(&mut aggregate, &creation);
@@ -595,8 +652,7 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_removes_storage_for_deleted_accounts() {
         let address = Address::repeat_byte(0x04);
-        let original =
-            AccountInfoRef { balance: U256::from(1), nonce: 1, code_hash: B256::ZERO, code: None };
+        let original = account_info(1);
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();
@@ -613,8 +669,7 @@ mod tests {
                 },
             )
             .unwrap();
-            tee.account(AccountChangeRef { address, original: Some(original), current: None })
-                .unwrap();
+            tee.account(account_change(address, Some(&original), None)).unwrap();
         }
 
         let recomputed =
@@ -627,8 +682,7 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_drops_wipe_for_created_accounts() {
         let address = Address::repeat_byte(0x05);
-        let current =
-            AccountInfoRef { balance: U256::from(1), nonce: 1, code_hash: B256::ZERO, code: None };
+        let current = account_info(1);
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();
@@ -645,8 +699,7 @@ mod tests {
                 },
             )
             .unwrap();
-            tee.account(AccountChangeRef { address, original: None, current: Some(current) })
-                .unwrap();
+            tee.account(account_change(address, None, Some(&current))).unwrap();
         }
 
         let recomputed =
@@ -659,15 +712,13 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_keeps_created_account_storage_wipes_local() {
         let address = Address::repeat_byte(0x06);
-        let current =
-            AccountInfoRef { balance: U256::from(1), nonce: 1, code_hash: B256::ZERO, code: None };
+        let current = account_info(1);
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();
         {
             let mut tee = Tee::new(&mut accumulator, &mut sink);
-            tee.account(AccountChangeRef { address, original: None, current: Some(current) })
-                .unwrap();
+            tee.account(account_change(address, None, Some(&current))).unwrap();
             StateChangeSink::storage(
                 &mut tee,
                 StorageChange {
@@ -691,23 +742,15 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_keeps_created_marker_after_account_update() {
         let address = Address::repeat_byte(0x07);
-        let current =
-            AccountInfoRef { balance: U256::from(1), nonce: 1, code_hash: B256::ZERO, code: None };
-        let updated =
-            AccountInfoRef { balance: U256::from(2), nonce: 1, code_hash: B256::ZERO, code: None };
+        let current = account_info(1);
+        let updated = account_info(2);
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();
         {
             let mut tee = Tee::new(&mut accumulator, &mut sink);
-            tee.account(AccountChangeRef { address, original: None, current: Some(current) })
-                .unwrap();
-            tee.account(AccountChangeRef {
-                address,
-                original: Some(current),
-                current: Some(updated),
-            })
-            .unwrap();
+            tee.account(account_change(address, None, Some(&current))).unwrap();
+            tee.account(account_change(address, Some(&current), Some(&updated))).unwrap();
             tee.storage_wipe(address).unwrap();
         }
 
@@ -721,17 +764,14 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_keeps_wipe_for_existing_account_recreation() {
         let address = Address::repeat_byte(0x08);
-        let original =
-            AccountInfoRef { balance: U256::from(1), nonce: 1, code_hash: B256::ZERO, code: None };
-        let current =
-            AccountInfoRef { balance: U256::from(2), nonce: 1, code_hash: B256::ZERO, code: None };
+        let original = account_info(1);
+        let current = account_info(2);
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();
         {
             let mut tee = Tee::new(&mut accumulator, &mut sink);
-            tee.account(AccountChangeRef { address, original: Some(original), current: None })
-                .unwrap();
+            tee.account(account_change(address, Some(&original), None)).unwrap();
             tee.storage_wipe(address).unwrap();
             StateChangeSink::storage(
                 &mut tee,
@@ -743,8 +783,7 @@ mod tests {
                 },
             )
             .unwrap();
-            tee.account(AccountChangeRef { address, original: None, current: Some(current) })
-                .unwrap();
+            tee.account(account_change(address, None, Some(&current))).unwrap();
         }
 
         let recomputed =

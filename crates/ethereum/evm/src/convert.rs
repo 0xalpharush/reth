@@ -8,13 +8,13 @@ use alloy_eips::eip7840::BlobParams;
 use alloy_primitives::{Address, BlockNumber, BlockTimestamp, B256, U256};
 use alloy_rpc_types_engine::ExecutionData;
 use evm2::{
-    env::BlockEnv,
-    ethereum::{LazyTxEip7702, RecoveredTxEnvelope},
+    env::{BlockEnv, BlockEnvExt},
+    ethereum::RecoveredTxEnvelope,
     SpecId,
 };
 use reth_chainspec::EthereumHardforks;
 use reth_ethereum_primitives::TransactionSigned;
-use reth_evm::{ExecutableTxParts, FromTxWithEncoded, RecoveredTx};
+use reth_evm::{ExecutableTxParts, FromRecoveredTx, FromTxWithEncoded, RecoveredTx};
 
 /// Map the latest active Ethereum hardfork at `timestamp` or `block_number` to a [`SpecId`].
 pub(crate) fn spec_id_by_timestamp_and_block_number<C>(
@@ -72,7 +72,7 @@ pub(crate) fn block_env_with_blob_params<H: BlockHeader>(
     header: &H,
     blob_params: Option<BlobParams>,
 ) -> BlockEnv {
-    BlockEnv {
+    BlockEnvExt {
         number: U256::from(header.number()),
         beneficiary: header.beneficiary(),
         timestamp: U256::from(header.timestamp()),
@@ -97,7 +97,7 @@ pub(crate) fn payload_block_env(
     blob_params: Option<BlobParams>,
 ) -> BlockEnv {
     let payload = &payload.payload;
-    BlockEnv {
+    BlockEnvExt {
         number: U256::from(payload.block_number()),
         beneficiary: payload.fee_recipient(),
         timestamp: U256::from(payload.timestamp()),
@@ -127,11 +127,6 @@ pub struct EthTxEnv {
 }
 
 impl EthTxEnv {
-    /// Returns the wrapped transaction envelope.
-    pub const fn as_envelope(&self) -> &RecoveredTxEnvelope {
-        &self.envelope
-    }
-
     /// Returns the original transaction hash.
     pub const fn tx_hash(&self) -> B256 {
         self.tx_hash
@@ -143,22 +138,16 @@ impl EthTxEnv {
     }
 }
 
-impl AsRef<RecoveredTxEnvelope> for EthTxEnv {
-    fn as_ref(&self) -> &RecoveredTxEnvelope {
-        self.as_envelope()
-    }
-}
-
-impl core::borrow::Borrow<RecoveredTxEnvelope> for EthTxEnv {
-    fn borrow(&self) -> &RecoveredTxEnvelope {
-        self.as_envelope()
-    }
-}
-
 impl From<Recovered<TransactionSigned>> for EthTxEnv {
     fn from(value: Recovered<TransactionSigned>) -> Self {
         let tx_hash = *value.tx_hash();
         Self { envelope: recovered_tx_envelope(value), tx_hash }
+    }
+}
+
+impl FromRecoveredTx<TransactionSigned> for EthTxEnv {
+    fn from_recovered_tx(tx: Recovered<TransactionSigned>) -> Self {
+        tx.into()
     }
 }
 
@@ -189,36 +178,17 @@ impl RecoveredTx<TransactionSigned> for ExecutableRecoveredTx {
     }
 }
 
-impl ExecutableTxParts<EthTxEnv, TransactionSigned> for ExecutableRecoveredTx {
+impl ExecutableTxParts<RecoveredTxEnvelope, TransactionSigned> for ExecutableRecoveredTx {
     type Recovered = Recovered<TransactionSigned>;
 
-    fn into_parts(self) -> (EthTxEnv, Self::Recovered) {
-        (self.tx_env, self.tx)
+    fn into_parts(self) -> (RecoveredTxEnvelope, Self::Recovered) {
+        (self.tx_env.into_envelope(), self.tx)
     }
 }
 
 /// Converts an owned recovered Reth Ethereum transaction into a recovered envelope.
 pub(crate) fn recovered_tx_envelope(tx: Recovered<TransactionSigned>) -> RecoveredTxEnvelope {
-    let (tx, signer) = tx.into_parts();
-    match tx {
-        TransactionSigned::Legacy(tx) => {
-            RecoveredTxEnvelope::Legacy(Recovered::new_unchecked(tx.strip_signature(), signer))
-        }
-        TransactionSigned::Eip2930(tx) => {
-            RecoveredTxEnvelope::Eip2930(Recovered::new_unchecked(tx.strip_signature(), signer))
-        }
-        TransactionSigned::Eip1559(tx) => {
-            RecoveredTxEnvelope::Eip1559(Recovered::new_unchecked(tx.strip_signature(), signer))
-        }
-        TransactionSigned::Eip4844(tx) => RecoveredTxEnvelope::Eip4844(Recovered::new_unchecked(
-            tx.strip_signature().into(),
-            signer,
-        )),
-        TransactionSigned::Eip7702(tx) => RecoveredTxEnvelope::Eip7702(Recovered::new_unchecked(
-            LazyTxEip7702::from_recovered_authorizations(tx.strip_signature()),
-            signer,
-        )),
-    }
+    tx.convert()
 }
 
 #[cfg(test)]

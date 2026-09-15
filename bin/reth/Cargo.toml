@@ -81,9 +81,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 toml.workspace = true
 zstd.workspace = true
 
-[build-dependencies]
-evm2-jit-build.workspace = true
-
 [features]
 default = [
     "jemalloc",
@@ -196,6 +193,7 @@ min-trace-logs = [
     "reth-node-core/min-trace-logs",
 ]
 
+partial-persistence = ["reth-node-core/partial-persistence"]
 trie-debug = ["reth-node-builder/trie-debug", "reth-node-core/trie-debug"]
 
 [[bin]]

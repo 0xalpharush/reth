@@ -1,9 +1,9 @@
 //! EVM-backed Ethereum execution helpers.
 
+use crate::dao_fork;
+
 #[cfg(test)]
 use crate::convert::recovered_tx_envelope;
-#[cfg(test)]
-use crate::executor::HashedStateMode;
 #[cfg(test)]
 use crate::RethReceiptBuilder;
 use alloc::{
@@ -13,20 +13,23 @@ use alloc::{
     vec::Vec,
 };
 #[cfg(test)]
-use alloy_consensus::transaction::Recovered;
+use alloy_consensus::Transaction;
 #[cfg(test)]
 use alloy_consensus::TxType;
-use alloy_consensus::{constants::ETH_TO_WEI, transaction::Transaction, BlockHeader, Header};
-#[cfg(test)]
-use alloy_eips::eip2718::Typed2718;
+use alloy_consensus::{
+    constants::ETH_TO_WEI, transaction::Recovered, BlockHeader, Header, TxReceipt,
+};
 use alloy_eips::{
+    eip2718::Typed2718,
     eip4895::Withdrawal,
     eip6110::{DEPOSIT_REQUEST_TYPE, MAINNET_DEPOSIT_CONTRACT_ADDRESS},
     eip7002::WITHDRAWAL_REQUEST_TYPE,
     eip7251::CONSOLIDATION_REQUEST_TYPE,
     eip7685::Requests,
 };
-use alloy_primitives::{map::AddressMap, Address, Bytes, B256, KECCAK256_EMPTY, U256};
+#[cfg(test)]
+use alloy_primitives::keccak256;
+use alloy_primitives::{map::AddressMap, Address, Bytes, Log, B256, KECCAK256_EMPTY, U256};
 use alloy_sol_types::{sol, SolEvent};
 use core::{any::Any, convert::Infallible};
 #[cfg(test)]
@@ -35,35 +38,37 @@ use evm2::evm::Db;
 use evm2::Precompiles;
 use evm2::{
     bytecode::Bytecode as ExecutableBytecode,
-    ethereum::RecoveredTxEnvelope,
     evm::{
-        AccountChange, AccountChangeRef, AccountInfo, BlockStateAccumulator, StateChangeSink,
-        StateChangeSource, StateChanges, StorageChange, SystemTx, BEACON_ROOTS_ADDRESS,
-        BUILDER_DEPOSIT_REQUEST_ADDRESS, BUILDER_EXIT_REQUEST_ADDRESS,
-        CONSOLIDATION_REQUEST_ADDRESS, HISTORY_STORAGE_ADDRESS, WITHDRAWAL_REQUEST_ADDRESS,
+        AccountChangeRef, AccountInfo, BlockStateAccumulator, StateChangeSink, StateChangeSource,
+        StorageChange, SystemTx, BEACON_ROOTS_ADDRESS, BUILDER_DEPOSIT_REQUEST_ADDRESS,
+        BUILDER_EXIT_REQUEST_ADDRESS, CONSOLIDATION_REQUEST_ADDRESS, HISTORY_STORAGE_ADDRESS,
+        WITHDRAWAL_REQUEST_ADDRESS,
     },
     registry::HandlerError,
-    BaseEvmTypes, ErrorCode, Evm, SpecId, TxResult, TxResultWithState,
+    ErrorCode, Evm, EvmTypes, SpecId, TxResult, TxResultWithState,
 };
 #[cfg(test)]
 use evm2::{
-    env::BlockEnv,
-    ethereum::ethereum_tx_registry,
+    env::BlockEnv as EvmBlockEnv,
+    ethereum::{ethereum_tx_registry, RecoveredTxEnvelope},
     evm::{precompile::PrecompileProvider, Database, DynDatabase},
-    ExecutionConfig, Version,
+    BaseEvmTypes, ExecutionConfig, Version,
 };
+#[cfg(test)]
+type BlockEnv = EvmBlockEnv<BaseEvmTypes>;
 use reth_ethereum_forks::EthereumHardforks;
+#[cfg(test)]
+use reth_ethereum_primitives::eip7997::{FACTORY_ADDRESS, FACTORY_CODE};
+#[cfg(test)]
 use reth_ethereum_primitives::Receipt;
 #[cfg(test)]
 use reth_ethereum_primitives::TransactionSigned;
-use reth_evm::{
-    BlockExecutionError, BlockValidationError, CommitChanges, EvmError, InvalidTxError,
-};
+use reth_evm::{BlockExecutionError, BlockValidationError, EvmError, InvalidTxError};
 #[cfg(test)]
 use reth_evm::{ReceiptBuilder, ReceiptBuilderCtx};
-#[cfg(test)]
-use reth_execution_types::BlockExecutionOutput;
 use reth_execution_types::HashedPostStateSink;
+#[cfg(test)]
+use reth_execution_types::{BlockExecutionOutput, BlockExecutionResult};
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 
 const DEPOSIT_BYTES_SIZE: usize = 48 + 32 + 8 + 96 + 8;
@@ -293,7 +298,7 @@ where
 }
 
 /// Additional block-level execution context.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct BlockExecutionContext<'a> {
     /// Pre-block system calls to run before transaction execution.
     pub system_calls: Option<BlockSystemCalls>,
@@ -303,12 +308,6 @@ pub(crate) struct BlockExecutionContext<'a> {
     pub withdrawals: Option<&'a [Withdrawal]>,
     /// Deposit contract address used to derive EIP-6110 deposit requests from receipts.
     pub deposit_contract_address: Option<Address>,
-}
-
-impl Default for BlockExecutionContext<'_> {
-    fn default() -> Self {
-        Self { system_calls: None, ommers: None, withdrawals: None, deposit_contract_address: None }
-    }
 }
 
 /// Inputs required by Ethereum pre-block system calls.
@@ -358,7 +357,7 @@ where
     ) -> Result<BlockExecutionOutput<Receipt>, EthExecutionError> {
         match self.execute_fallible_envelopes::<Infallible, Infallible, _, _, _, _>(
             transactions.into_iter().map(recovered_tx_envelope).map(Ok::<_, Infallible>),
-            ExecutionHooks::new(|_| {}, ignore_receipt, |_| {}, HashedStateMode::OutputOnly),
+            ExecutionHooks::new(|_| {}, ignore_receipt, |_| {}, false),
         ) {
             Ok(output) => Ok(output),
             Err(PayloadExecutionError::Execution(err)) => Err(err),
@@ -391,7 +390,7 @@ where
             mut on_transaction_executed,
             mut on_receipt,
             mut on_hashed_state_update,
-            hashed_state_mode,
+            stream_hashed_state,
         } = hooks;
 
         let block_beneficiary = block_env.beneficiary;
@@ -409,7 +408,7 @@ where
         pre_execution_system_call_state_changes(
             &mut evm,
             &mut block_state,
-            hashed_state_mode.stream(),
+            stream_hashed_state,
             &mut on_hashed_state_update,
             spec_id,
             block_number,
@@ -427,13 +426,13 @@ where
             let outcome = execute_transaction(
                 &mut evm,
                 &mut block_state,
-                hashed_state_mode.stream(),
+                stream_hashed_state,
                 &mut on_hashed_state_update,
                 &transaction,
             )?;
             cumulative_gas_used += outcome.tx_gas_used();
             blob_gas_used += tx_blob_gas_used;
-            let receipt = RethReceiptBuilder.build_receipt(ReceiptBuilderCtx {
+            let receipt = RethReceiptBuilder.build_receipt::<BaseEvmTypes>(ReceiptBuilderCtx {
                 tx_type,
                 result: outcome,
                 cumulative_gas_used,
@@ -447,7 +446,7 @@ where
         post_execution_system_call_state_changes(
             &mut evm,
             &mut block_state,
-            hashed_state_mode.stream(),
+            stream_hashed_state,
             &mut on_hashed_state_update,
             spec_id,
             context,
@@ -457,28 +456,29 @@ where
         post_block_balance_state_changes(
             &mut evm,
             &mut block_state,
-            hashed_state_mode.stream(),
+            stream_hashed_state,
             &mut on_hashed_state_update,
             base_block_reward_for_spec_id(spec_id),
+            false,
             block_number,
             block_beneficiary,
             context.ommers,
             context.withdrawals,
         )?;
 
-        let mut output =
-            RethReceiptBuilder.build_block_output(receipts, block_state, blob_gas_used);
-        output.result.requests = requests;
+        let gas_used = receipts.last().map_or(0, TxReceipt::cumulative_gas_used);
+        let output = BlockExecutionOutput::new(
+            BlockExecutionResult { receipts, requests, gas_used, blob_gas_used },
+            block_state,
+        );
 
         Ok(output)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn transaction_blob_gas_used(transaction: &RecoveredTxEnvelope) -> u64 {
-    transaction
-        .as_eip4844()
-        .map(|tx| tx.inner().blob_gas_used().unwrap_or_default())
-        .unwrap_or_default()
+    transaction.as_eip4844().map(|tx| tx.blob_gas_used().unwrap_or_default()).unwrap_or_default()
 }
 
 /// Hooks invoked while executing an Ethereum block.
@@ -487,7 +487,7 @@ pub(crate) struct ExecutionHooks<F, R, H> {
     on_transaction_executed: F,
     on_receipt: R,
     on_hashed_state_update: H,
-    hashed_state_mode: HashedStateMode,
+    stream_hashed_state: bool,
 }
 
 #[cfg(test)]
@@ -497,9 +497,9 @@ impl<F, R, H> ExecutionHooks<F, R, H> {
         on_transaction_executed: F,
         on_receipt: R,
         on_hashed_state_update: H,
-        hashed_state_mode: HashedStateMode,
+        stream_hashed_state: bool,
     ) -> Self {
-        Self { on_transaction_executed, on_receipt, on_hashed_state_update, hashed_state_mode }
+        Self { on_transaction_executed, on_receipt, on_hashed_state_update, stream_hashed_state }
     }
 }
 
@@ -602,7 +602,7 @@ where
     .execute_recovered_transactions(transactions)
 }
 
-fn map_handler_error(evm: &mut Evm<'_, BaseEvmTypes>, err: HandlerError) -> EthExecutionError {
+fn map_handler_error<T: EvmTypes>(evm: &mut Evm<'_, T>, err: HandlerError) -> EthExecutionError {
     match err {
         HandlerError::Fatal(code) => map_db_error_code(evm, code),
         err if handler_error_is_invalid_tx(&err) => {
@@ -612,7 +612,7 @@ fn map_handler_error(evm: &mut Evm<'_, BaseEvmTypes>, err: HandlerError) -> EthE
     }
 }
 
-fn take_database_error(evm: &mut Evm<'_, BaseEvmTypes>, code: ErrorCode) -> DynamicDatabaseError {
+fn take_database_error<T: EvmTypes>(evm: &mut Evm<'_, T>, code: ErrorCode) -> DynamicDatabaseError {
     DynamicDatabaseError::new(evm.database_mut().error(code))
 }
 
@@ -704,34 +704,35 @@ fn send_hashed_state_update(
 }
 
 #[cfg(test)]
-pub(crate) fn execute_transaction(
-    evm: &mut Evm<'_, BaseEvmTypes>,
+pub(crate) fn execute_transaction<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
     block_state: &mut BlockStateAccumulator,
     stream_hashed_state: bool,
     on_hashed_state_update: &mut impl FnMut(HashedPostState),
-    transaction: &RecoveredTxEnvelope,
-) -> Result<TxResult, EthExecutionError> {
-    execute_transaction_with_commit_condition(
+    transaction: &Recovered<T::Tx>,
+) -> Result<TxResult<T>, EthExecutionError>
+where
+    T::Tx: Typed2718,
+{
+    let output = execute_transaction_without_commit(evm, transaction)?;
+    Ok(commit_detached_transaction(
         evm,
         block_state,
         stream_hashed_state,
         on_hashed_state_update,
-        transaction,
-        |_| CommitChanges::Yes,
-    )
-    .map(|outcome| outcome.expect("transaction is always committed"))
+        output,
+    ))
 }
 
-pub(crate) fn execute_transaction_with_commit_condition(
-    evm: &mut Evm<'_, BaseEvmTypes>,
-    block_state: &mut BlockStateAccumulator,
-    stream_hashed_state: bool,
-    on_hashed_state_update: &mut impl FnMut(HashedPostState),
-    transaction: &RecoveredTxEnvelope,
-    should_commit: impl FnOnce(&TxResult) -> CommitChanges,
-) -> Result<Option<TxResult>, EthExecutionError> {
-    enum TransactionResolution {
-        Outcome(Option<TxResult>),
+pub(crate) fn execute_transaction_without_commit<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
+    transaction: &Recovered<T::Tx>,
+) -> Result<TxResultWithState<T>, EthExecutionError>
+where
+    T::Tx: Typed2718,
+{
+    enum TransactionResolution<U: EvmTypes> {
+        Outcome(TxResultWithState<U>),
         DatabaseError(ErrorCode),
         HandlerError(HandlerError),
     }
@@ -741,17 +742,8 @@ pub(crate) fn execute_transaction_with_commit_condition(
             if let Some(code) = executed.result().error_code {
                 let _ = executed.discard();
                 TransactionResolution::DatabaseError(code)
-            } else if !should_commit(executed.result()).should_commit() {
-                let _ = executed.discard();
-                TransactionResolution::Outcome(None)
             } else {
-                let outcome = {
-                    let mut sink = RethStateSink::new(None, block_state, stream_hashed_state);
-                    let Ok(outcome) = executed.commit_with(&mut sink);
-                    sink.flush_streamed_hashed_state(on_hashed_state_update);
-                    outcome
-                };
-                TransactionResolution::Outcome(Some(outcome))
+                TransactionResolution::<T>::Outcome(executed.detach())
             }
         }
         Err(err) => TransactionResolution::HandlerError(err),
@@ -764,58 +756,40 @@ pub(crate) fn execute_transaction_with_commit_condition(
     }
 }
 
-pub(crate) fn execute_transaction_without_commit(
-    evm: &mut Evm<'_, BaseEvmTypes>,
-    transaction: &RecoveredTxEnvelope,
-) -> Result<TxResultWithState, EthExecutionError> {
-    enum TransactionResolution {
-        Outcome(TxResultWithState),
-        DatabaseError(ErrorCode),
-        HandlerError(HandlerError),
-    }
-
-    let resolution = match evm.transact(transaction) {
-        Ok(executed) => {
-            if let Some(code) = executed.result().error_code {
-                let _ = executed.discard();
-                TransactionResolution::DatabaseError(code)
-            } else {
-                TransactionResolution::Outcome(executed.detach())
-            }
-        }
-        Err(err) => TransactionResolution::HandlerError(err),
-    };
-
-    match resolution {
-        TransactionResolution::Outcome(outcome) => Ok(outcome),
-        TransactionResolution::DatabaseError(code) => Err(map_db_error_code(evm, code)),
-        TransactionResolution::HandlerError(err) => Err(map_handler_error(evm, err)),
-    }
-}
-
-pub(crate) fn commit_detached_transaction(
-    evm: &mut Evm<'_, BaseEvmTypes>,
+pub(crate) fn commit_detached_transaction<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
     block_state: &mut BlockStateAccumulator,
     stream_hashed_state: bool,
     on_hashed_state_update: &mut impl FnMut(HashedPostState),
-    output: TxResultWithState,
-) -> TxResult {
-    let state_changes = output.state_changes;
-    if evm.state().bal_builder().is_some() {
-        evm.state_mut().overlay_db_mut().bal_context.commit_bal(&state_changes);
-    }
-
-    let result = {
-        let mut sink = RethStateSink::new(None, block_state, stream_hashed_state);
-        let Ok(()) = state_changes.visit(&mut sink);
-        sink.flush_streamed_hashed_state(on_hashed_state_update);
-        output.result
-    };
-    evm.state_mut().commit_source(&state_changes);
+    output: TxResultWithState<T>,
+) -> TxResult<T> {
+    let TxResultWithState { result, pending_state, .. } = output;
+    commit_pending_state(
+        evm,
+        block_state,
+        stream_hashed_state,
+        on_hashed_state_update,
+        &pending_state,
+    );
     result
 }
 
-fn map_db_error_code(evm: &mut Evm<'_, BaseEvmTypes>, code: ErrorCode) -> EthExecutionError {
+pub(crate) fn commit_pending_state<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
+    block_state: &mut BlockStateAccumulator,
+    stream_hashed_state: bool,
+    on_hashed_state_update: &mut impl FnMut(HashedPostState),
+    pending_state: &evm2::evm::PendingState,
+) {
+    {
+        let mut sink = RethStateSink::new(None, block_state, stream_hashed_state);
+        let Ok(()) = pending_state.visit(&mut sink);
+        sink.flush_streamed_hashed_state(on_hashed_state_update);
+    }
+    evm.overlay_db_mut().commit_pending(pending_state);
+}
+
+fn map_db_error_code<T: EvmTypes>(evm: &mut Evm<'_, T>, code: ErrorCode) -> EthExecutionError {
     if code == ErrorCode::BAL_NOT_COVERED {
         EthExecutionError::BlockAccessListNotCovered
     } else {
@@ -823,8 +797,8 @@ fn map_db_error_code(evm: &mut Evm<'_, BaseEvmTypes>, code: ErrorCode) -> EthExe
     }
 }
 
-pub(crate) fn pre_execution_system_call_state_changes(
-    evm: &mut Evm<'_, BaseEvmTypes>,
+pub(crate) fn pre_execution_system_call_state_changes<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
     block_state: &mut BlockStateAccumulator,
     stream_hashed_state: bool,
     on_hashed_state_update: &mut impl FnMut(HashedPostState),
@@ -873,11 +847,14 @@ pub(crate) fn pre_execution_system_call_state_changes(
     Ok(())
 }
 
-pub(crate) fn block_requests_from_receipts(
+pub(crate) fn block_requests_from_receipts<R>(
     spec_id: SpecId,
     context: BlockExecutionContext<'_>,
-    receipts: &[Receipt],
-) -> Result<Requests, EthExecutionError> {
+    receipts: &[R],
+) -> Result<Requests, EthExecutionError>
+where
+    R: TxReceipt<Log = Log>,
+{
     let mut requests = Requests::default();
     if context.system_calls.is_none() || !spec_id.enables(SpecId::PRAGUE) {
         return Ok(requests)
@@ -892,13 +869,16 @@ pub(crate) fn block_requests_from_receipts(
     Ok(requests)
 }
 
-fn parse_deposit_requests_from_receipts(
+fn parse_deposit_requests_from_receipts<R>(
     deposit_contract_address: Address,
-    receipts: &[Receipt],
-) -> Result<Vec<u8>, EthExecutionError> {
+    receipts: &[R],
+) -> Result<Vec<u8>, EthExecutionError>
+where
+    R: TxReceipt<Log = Log>,
+{
     let mut out = Vec::new();
     for receipt in receipts {
-        for log in &receipt.logs {
+        for log in receipt.logs() {
             if log.address != deposit_contract_address ||
                 log.topics().first() != Some(&DepositEvent::SIGNATURE_HASH)
             {
@@ -919,8 +899,8 @@ fn parse_deposit_requests_from_receipts(
     Ok(out)
 }
 
-pub(crate) fn post_execution_system_call_state_changes(
-    evm: &mut Evm<'_, BaseEvmTypes>,
+pub(crate) fn post_execution_system_call_state_changes<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
     block_state: &mut BlockStateAccumulator,
     stream_hashed_state: bool,
     on_hashed_state_update: &mut impl FnMut(HashedPostState),
@@ -989,16 +969,16 @@ pub(crate) fn post_execution_system_call_state_changes(
     Ok(())
 }
 
-fn execute_system_call(
-    evm: &mut Evm<'_, BaseEvmTypes>,
+fn execute_system_call<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
     block_state: &mut BlockStateAccumulator,
     stream_hashed_state: bool,
     on_hashed_state_update: &mut impl FnMut(HashedPostState),
     address: Address,
     data: Bytes,
-) -> Result<TxResult, EthExecutionError> {
-    enum SystemCallResolution {
-        Outcome(TxResult),
+) -> Result<TxResult<T>, EthExecutionError> {
+    enum SystemCallResolution<U: EvmTypes> {
+        Outcome(TxResult<U>),
         DatabaseError(ErrorCode),
         HandlerError(HandlerError),
         Failed(String),
@@ -1020,7 +1000,7 @@ fn execute_system_call(
                     sink.flush_streamed_hashed_state(on_hashed_state_update);
                     outcome
                 };
-                SystemCallResolution::Outcome(outcome)
+                SystemCallResolution::<T>::Outcome(outcome)
             }
         }
         Err(err) => SystemCallResolution::HandlerError(err),
@@ -1036,23 +1016,28 @@ fn execute_system_call(
     }
 }
 
-fn commit_state_changes(
-    evm: &mut Evm<'_, BaseEvmTypes>,
+fn commit_state_changes<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
     block_state: &mut BlockStateAccumulator,
     stream_hashed_state: bool,
     on_hashed_state_update: &mut impl FnMut(HashedPostState),
-    changes: &StateChanges,
+    changes: &[(Address, Option<AccountInfo>, Option<AccountInfo>)],
 ) {
-    if evm.state().bal_builder().is_some() {
-        evm.state_mut().overlay_db_mut().bal_context.commit_bal(changes);
-    }
     let result = {
         let mut sink = RethStateSink::new(
             Some(evm.overlay_db_mut() as &mut dyn StateChangeSink<Error = Infallible>),
             block_state,
             stream_hashed_state,
         );
-        let result = changes.visit(&mut sink);
+        let result = changes.iter().try_for_each(|(address, original, current)| {
+            sink.account(AccountChangeRef {
+                address: *address,
+                original: original.as_ref(),
+                current: current.as_ref(),
+                created: false,
+                selfdestructed: false,
+            })
+        });
         if result.is_ok() {
             sink.flush_streamed_hashed_state(on_hashed_state_update);
         }
@@ -1065,12 +1050,13 @@ fn commit_state_changes(
 }
 
 #[expect(clippy::too_many_arguments)]
-pub(crate) fn post_block_balance_state_changes(
-    evm: &mut Evm<'_, BaseEvmTypes>,
+pub(crate) fn post_block_balance_state_changes<T: EvmTypes>(
+    evm: &mut Evm<'_, T>,
     block_state: &mut BlockStateAccumulator,
     stream_hashed_state: bool,
     on_hashed_state_update: &mut impl FnMut(HashedPostState),
     base_block_reward: Option<u128>,
+    dao_fork_transition: bool,
     block_number: u64,
     block_beneficiary: Address,
     ommers: Option<&[Header]>,
@@ -1092,11 +1078,33 @@ pub(crate) fn post_block_balance_state_changes(
         *balance_increments.entry(withdrawal.address).or_default() += withdrawal.amount_wei();
     }
 
+    let mut changes = Vec::new();
+
+    if dao_fork_transition {
+        let mut drained_balance = U256::ZERO;
+        for address in dao_fork::DAO_HARDFORK_ACCOUNTS {
+            let original =
+                evm.read_account_info(&address).map_err(|code| map_db_error_code(evm, code))?;
+            let Some(original) = original else { continue };
+            if original.balance.is_zero() {
+                continue
+            }
+
+            drained_balance = drained_balance.saturating_add(original.balance);
+            let mut current = original.clone();
+            current.balance = U256::ZERO;
+            changes.push((address, Some(original), Some(current)));
+        }
+
+        if !drained_balance.is_zero() {
+            *balance_increments.entry(dao_fork::DAO_HARDFORK_BENEFICIARY).or_default() +=
+                drained_balance;
+        }
+    }
+
     if balance_increments.is_empty() {
         return Ok(());
     }
-
-    let mut changes = StateChanges::default();
 
     for (address, increment) in balance_increments {
         let original =
@@ -1112,10 +1120,7 @@ pub(crate) fn post_block_balance_state_changes(
         if original == current {
             continue
         }
-        let mut change = AccountChange::default();
-        change.original = original;
-        change.current = current;
-        changes.accounts.insert(address, change);
+        changes.push((address, original, current));
     }
 
     commit_state_changes(evm, block_state, stream_hashed_state, on_hashed_state_update, &changes);
@@ -1173,7 +1178,7 @@ const fn empty_account() -> AccountInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::collections::BTreeMap;
+    use alloc::{collections::BTreeMap, vec::Vec};
     use alloy_consensus::{SignableTransaction, TxLegacy};
     use alloy_eips::{
         eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_CODE},
@@ -1228,6 +1233,16 @@ mod tests {
         )
     }
 
+    fn create2_address(deployer: Address, salt: &[u8; 32], init_code: &Bytes) -> Address {
+        let mut input = Vec::with_capacity(1 + 20 + 32 + 32);
+        input.push(0xff);
+        input.extend_from_slice(deployer.as_slice());
+        input.extend_from_slice(salt);
+        input.extend_from_slice(keccak256(init_code).as_slice());
+        let hash = keccak256(input);
+        Address::from_slice(&hash.as_slice()[12..])
+    }
+
     #[derive(Default)]
     struct TestDatabase {
         accounts: BTreeMap<Address, AccountInfo>,
@@ -1249,8 +1264,8 @@ mod tests {
             Ok(self.storage.get(&(*address, *key)).copied().unwrap_or_default())
         }
 
-        fn get_block_hash(&mut self, _number: &Word) -> Result<Option<B256>, Self::Error> {
-            Ok(None)
+        fn get_block_hash(&mut self, _number: &Word) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
         }
     }
 
@@ -1289,6 +1304,70 @@ mod tests {
     }
 
     #[test]
+    fn executes_eip7997_factory() {
+        let caller = address!("0000000000000000000000000000000000000001");
+        let salt = [0x42; 32];
+        let init_code = Bytes::from_static(&[
+            op::PUSH1,
+            0,
+            op::PUSH1,
+            0,
+            op::MSTORE8,
+            op::PUSH1,
+            1,
+            op::PUSH1,
+            0,
+            op::RETURN,
+        ]);
+        let target = create2_address(FACTORY_ADDRESS, &salt, &init_code);
+        let input = Bytes::from([salt.as_slice(), init_code.as_ref()].concat());
+
+        let mut database = TestDatabase::default();
+        database.accounts.insert(
+            caller,
+            AccountInfo::default().with_nonce(1).with_balance(U256::from(ETH_TO_WEI)),
+        );
+        database.accounts.insert(
+            FACTORY_ADDRESS,
+            AccountInfo::default().with_nonce(1).with_code(Bytecode::new_raw(FACTORY_CODE)),
+        );
+
+        let transaction = Recovered::new_unchecked(
+            TransactionSigned::Legacy(
+                TxLegacy {
+                    nonce: 1,
+                    gas_price: 1,
+                    gas_limit: 1_000_000,
+                    to: TxKind::Call(FACTORY_ADDRESS),
+                    input,
+                    ..Default::default()
+                }
+                .into_signed(Signature::test_signature()),
+            ),
+            caller,
+        );
+
+        let output = execute_block(
+            SpecId::AMSTERDAM,
+            BlockEnv { gas_limit: U256::from(2_000_000), ..Default::default() },
+            database,
+            1,
+            [transaction],
+        )
+        .expect("factory transaction succeeds");
+
+        assert!(output.result.receipts[0].success);
+        let factory = output.account_state(&FACTORY_ADDRESS).unwrap().current.as_ref().unwrap();
+        assert_eq!(factory.balance, U256::ZERO);
+        assert_eq!(factory.code_hash, keccak256(FACTORY_CODE.as_ref()));
+        assert_eq!(factory.nonce, 2);
+
+        let account = output.account_state(&target).unwrap().current.as_ref().unwrap();
+        assert_eq!(account.nonce, 1);
+        assert_eq!(output.bytecode(&account.code_hash).unwrap().original_bytes().as_ref(), &[0]);
+    }
+
+    #[test]
     fn fallible_transaction_stream_is_consumed_lazily() {
         let caller = address!("0000000000000000000000000000000000000001");
         let target = address!("0000000000000000000000000000000000001000");
@@ -1309,12 +1388,7 @@ mod tests {
         )
         .execute_fallible_envelopes::<TestTxError, Infallible, _, _, _, _>(
             [Ok(recovered_tx_envelope(transaction)), Err(TestTxError)],
-            ExecutionHooks::new(
-                |count| executed = count,
-                ignore_receipt,
-                |_| {},
-                HashedStateMode::OutputOnly,
-            ),
+            ExecutionHooks::new(|count| executed = count, ignore_receipt, |_| {}, false),
         );
 
         assert_eq!(executed, 1);
@@ -1354,7 +1428,7 @@ mod tests {
                     Ok::<(), Infallible>(())
                 },
                 |_| {},
-                HashedStateMode::OutputOnly,
+                false,
             ),
         )
         .expect("EVM execution succeeds");
@@ -1371,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn streams_hashed_state_without_output_hashed_state() {
+    fn hashed_state_hook_streams_updates() {
         let caller = address!("0000000000000000000000000000000000000001");
         let target = address!("0000000000000000000000000000000000001000");
         let mut database = TestDatabase::default();
@@ -1395,7 +1469,7 @@ mod tests {
                 |_| {},
                 ignore_receipt,
                 |update| streamed_updates.push(update),
-                HashedStateMode::StreamOnly,
+                true,
             ),
         )
         .expect("EVM execution succeeds");
@@ -1405,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn output_only_hashed_state_does_not_stream_updates() {
+    fn disabled_hashed_state_stream_does_not_emit_updates() {
         let caller = address!("0000000000000000000000000000000000000001");
         let target = address!("0000000000000000000000000000000000001000");
         let mut database = TestDatabase::default();
@@ -1429,7 +1503,7 @@ mod tests {
                 |_| {},
                 ignore_receipt,
                 |update| streamed_updates.push(update),
-                HashedStateMode::OutputOnly,
+                false,
             ),
         )
         .expect("EVM execution succeeds");

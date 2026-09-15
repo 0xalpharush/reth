@@ -235,8 +235,8 @@ mod tests {
             Ok(self.storage.get(&(*address, *key)).copied().unwrap_or_default())
         }
 
-        fn get_block_hash(&mut self, _number: &U256) -> Result<Option<B256>, Self::Error> {
-            Ok(None)
+        fn get_block_hash(&mut self, _number: &U256) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
         }
     }
 
@@ -387,7 +387,7 @@ mod tests {
         executor.apply_pre_execution_changes().expect("serial pre-exec");
         for (index, tx) in txs.iter().cloned().enumerate() {
             executor
-                .execute_transaction(evm_config.tx_env(tx))
+                .execute_transaction(tx)
                 .unwrap_or_else(|err| panic!("serial tx {index} failed: {err:?}"));
         }
         let (output, bal) = executor.finish_with_block_access_list().expect("serial post-exec");

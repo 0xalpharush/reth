@@ -1,6 +1,6 @@
 use crate::{
     hashed_post_state_from_state_source, state, BlockExecutionOutput, BlockExecutionResult,
-    BlockReverts, EvmState, IndexedBlockState, RevertAccount, StorageReverts,
+    BlockReverts, EvmState, IndexedBlockState, RevertAccount, RevertToSlot, StorageReverts,
 };
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use alloy_consensus::constants::KECCAK_EMPTY;
@@ -11,8 +11,7 @@ use alloy_primitives::{
     Address, BlockNumber, Bloom, Log, B256, U256,
 };
 use evm2::evm::{
-    AccountChangeRef, AccountInfo, AccountInfoRef, BlockStateAccumulator, StateChangeSink,
-    StorageChange, Tracked,
+    AccountChangeRef, AccountInfo, BlockStateAccumulator, StateChangeSink, StorageChange, Tracked,
 };
 use reth_primitives_traits::{Account, Bytecode, Receipt, StorageEntry};
 
@@ -203,11 +202,15 @@ impl<T> ExecutionOutcome<T> {
 
         let mut accumulator = BlockStateAccumulator::new();
         for (address, (original, current, storage)) in state_init {
+            let original_info = original.as_ref().map(account_info_ref_from_reth);
+            let current_info = current.as_ref().map(account_info_ref_from_reth);
             accumulator
                 .account(AccountChangeRef {
                     address,
-                    original: original.as_ref().map(account_info_ref_from_reth),
-                    current: current.as_ref().map(account_info_ref_from_reth),
+                    original: original_info.as_ref(),
+                    current: current_info.as_ref(),
+                    created: false,
+                    selfdestructed: false,
                 })
                 .expect("infallible");
             for (slot, (original, current)) in storage {
@@ -236,7 +239,9 @@ impl<T> ExecutionOutcome<T> {
                     .filter_map(|(address, (_, storage))| {
                         let slots = storage
                             .into_iter()
-                            .map(|entry| (U256::from_be_bytes(entry.key.0), entry.value))
+                            .map(|entry| {
+                                (U256::from_be_bytes(entry.key.0), RevertToSlot::Some(entry.value))
+                            })
                             .collect::<BTreeMap<_, _>>();
                         (!slots.is_empty())
                             .then_some((address, StorageReverts { slots, ..Default::default() }))
@@ -635,12 +640,13 @@ impl<T> From<(BlockExecutionOutput<T>, BlockNumber)> for ExecutionOutcome<T> {
     }
 }
 
-fn account_info_ref_from_reth(account: &Account) -> AccountInfoRef<'_> {
-    AccountInfoRef {
+fn account_info_ref_from_reth(account: &Account) -> AccountInfo {
+    AccountInfo {
         balance: account.balance,
         nonce: account.nonce,
         code_hash: account.get_bytecode_hash(),
         code: None,
+        _non_exhaustive: (),
     }
 }
 
@@ -662,17 +668,28 @@ fn account_info_to_reth(info: &AccountInfo) -> Account {
 #[cfg(test)]
 fn multi_block_outcome_for_serde() -> ExecutionOutcome {
     let address = Address::repeat_byte(0x42);
+    let first = AccountInfo {
+        balance: U256::from(1),
+        nonce: 1,
+        code_hash: KECCAK_EMPTY,
+        code: None,
+        _non_exhaustive: (),
+    };
+    let second = AccountInfo {
+        balance: U256::from(3),
+        nonce: 2,
+        code_hash: KECCAK_EMPTY,
+        code: None,
+        _non_exhaustive: (),
+    };
     let mut block1 = BlockStateAccumulator::new();
     block1
         .account(AccountChangeRef {
             address,
             original: None,
-            current: Some(AccountInfoRef {
-                balance: U256::from(1),
-                nonce: 1,
-                code_hash: KECCAK_EMPTY,
-                code: None,
-            }),
+            current: Some(&first),
+            created: false,
+            selfdestructed: false,
         })
         .unwrap();
     StateChangeSink::storage(
@@ -685,18 +702,10 @@ fn multi_block_outcome_for_serde() -> ExecutionOutcome {
     block2
         .account(AccountChangeRef {
             address,
-            original: Some(AccountInfoRef {
-                balance: U256::from(1),
-                nonce: 1,
-                code_hash: KECCAK_EMPTY,
-                code: None,
-            }),
-            current: Some(AccountInfoRef {
-                balance: U256::from(3),
-                nonce: 2,
-                code_hash: KECCAK_EMPTY,
-                code: None,
-            }),
+            original: Some(&first),
+            current: Some(&second),
+            created: false,
+            selfdestructed: false,
         })
         .unwrap();
     block2.storage_wipe(address).unwrap();
@@ -726,138 +735,6 @@ fn assert_serde_preserves_block_operations(expected: ExecutionOutcome, actual: E
     assert_eq!(actual.split_at(11), expected.split_at(11));
 }
 
-#[cfg(any(feature = "serde", feature = "serde-bincode-compat"))]
-mod serde_state {
-    // `BlockStateAccumulator` lives in evm2 with private fields and does not currently implement
-    // serde. Until evm2 exposes serde derives for it upstream, this adapter is the narrow
-    // boundary that serializes it through the public `StateChangeSource` stream.
-    use super::*;
-    use alloy_primitives::Bytes;
-    use evm2::{bytecode::Bytecode as ExecutableBytecode, evm::StateChangeSource};
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-    pub(super) struct BlockStateSerde {
-        accounts: AddressMap<TrackedSerde<Option<RevertAccount>>>,
-        storage: AddressMap<StorageChangeSetSerde>,
-        contracts: B256Map<Bytes>,
-    }
-
-    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-    struct StorageChangeSetSerde {
-        wipe: bool,
-        slots: BTreeMap<U256, TrackedSerde<U256>>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    struct TrackedSerde<T> {
-        original: T,
-        current: T,
-    }
-
-    impl From<&EvmState> for BlockStateSerde {
-        fn from(state: &EvmState) -> Self {
-            let mut sink = BlockStateSerdeSink::default();
-            match state.visit(&mut sink) {
-                Ok(()) => {}
-                Err(err) => match err {},
-            }
-            sink.state
-        }
-    }
-
-    impl From<BlockStateSerde> for EvmState {
-        fn from(value: BlockStateSerde) -> Self {
-            let mut accumulator = Self::new();
-            for (code_hash, bytecode) in value.contracts {
-                accumulator
-                    .bytecode(code_hash, &ExecutableBytecode::new_raw(bytecode))
-                    .expect("infallible");
-            }
-            for (address, storage) in value.storage {
-                if storage.wipe {
-                    accumulator.storage_wipe(address).expect("infallible");
-                }
-                for (key, slot) in storage.slots {
-                    StateChangeSink::storage(
-                        &mut accumulator,
-                        StorageChange {
-                            address,
-                            key,
-                            original: slot.original,
-                            current: slot.current,
-                        },
-                    )
-                    .expect("infallible");
-                }
-            }
-            for (address, account) in value.accounts {
-                let original = account.original.map(|account| account.to_account_info());
-                let current = account.current.map(|account| account.to_account_info());
-                accumulator
-                    .account(AccountChangeRef {
-                        address,
-                        original: original.as_ref().map(account_info_ref),
-                        current: current.as_ref().map(account_info_ref),
-                    })
-                    .expect("infallible");
-            }
-            accumulator
-        }
-    }
-
-    #[derive(Default)]
-    struct BlockStateSerdeSink {
-        state: BlockStateSerde,
-    }
-
-    impl StateChangeSink for BlockStateSerdeSink {
-        type Error = core::convert::Infallible;
-
-        fn bytecode(
-            &mut self,
-            code_hash: B256,
-            code: &ExecutableBytecode,
-        ) -> Result<(), Self::Error> {
-            self.state.contracts.insert(code_hash, code.original_bytes());
-            Ok(())
-        }
-
-        fn account(&mut self, change: AccountChangeRef<'_>) -> Result<(), Self::Error> {
-            self.state.accounts.insert(
-                change.address,
-                TrackedSerde {
-                    original: change.original.map(RevertAccount::from),
-                    current: change.current.map(RevertAccount::from),
-                },
-            );
-            Ok(())
-        }
-
-        fn storage_wipe(&mut self, address: Address) -> Result<(), Self::Error> {
-            self.state.storage.entry(address).or_default().wipe = true;
-            Ok(())
-        }
-
-        fn storage(&mut self, change: StorageChange) -> Result<(), Self::Error> {
-            self.state.storage.entry(change.address).or_default().slots.insert(
-                change.key,
-                TrackedSerde { original: change.original, current: change.current },
-            );
-            Ok(())
-        }
-    }
-
-    const fn account_info_ref(info: &AccountInfo) -> AccountInfoRef<'_> {
-        AccountInfoRef {
-            balance: info.balance,
-            nonce: info.nonce,
-            code_hash: info.code_hash,
-            code: info.code.as_ref(),
-        }
-    }
-}
-
 #[cfg(feature = "serde")]
 mod serde_impl {
     use super::*;
@@ -868,8 +745,8 @@ mod serde_impl {
 
     #[derive(Serialize)]
     struct ExecutionOutcomeSerde<'a, T> {
-        state: serde_state::BlockStateSerde,
-        block_states: Vec<serde_state::BlockStateSerde>,
+        state: &'a EvmState,
+        block_states: &'a [EvmState],
         block_reverts: &'a [BlockReverts],
         receipts: &'a Vec<Vec<T>>,
         first_block: BlockNumber,
@@ -878,8 +755,8 @@ mod serde_impl {
 
     #[derive(Deserialize)]
     struct ExecutionOutcomeSerdeOwned<T> {
-        state: serde_state::BlockStateSerde,
-        block_states: Vec<serde_state::BlockStateSerde>,
+        state: EvmState,
+        block_states: Vec<EvmState>,
         block_reverts: Vec<BlockReverts>,
         receipts: Vec<Vec<T>>,
         first_block: BlockNumber,
@@ -895,12 +772,8 @@ mod serde_impl {
             S: Serializer,
         {
             ExecutionOutcomeSerde {
-                state: serde_state::BlockStateSerde::from(self.state.inner()),
-                block_states: self
-                    .block_states
-                    .iter()
-                    .map(serde_state::BlockStateSerde::from)
-                    .collect(),
+                state: self.state.inner(),
+                block_states: &self.block_states,
                 block_reverts: self.block_reverts(),
                 receipts: &self.receipts,
                 first_block: self.first_block,
@@ -920,8 +793,8 @@ mod serde_impl {
         {
             let value = ExecutionOutcomeSerdeOwned::<T>::deserialize(deserializer)?;
             Ok(Self::from_parts(
-                value.state.into(),
-                value.block_states.into_iter().map(Into::into).collect(),
+                value.state,
+                value.block_states,
                 value.block_reverts,
                 value.receipts,
                 value.first_block,
@@ -957,8 +830,8 @@ pub(super) mod serde_bincode_compat {
     /// ```
     #[derive(Debug, Serialize, Deserialize)]
     pub struct ExecutionOutcome<'a> {
-        state: super::serde_state::BlockStateSerde,
-        block_states: Vec<super::serde_state::BlockStateSerde>,
+        state: Cow<'a, super::EvmState>,
+        block_states: Vec<super::EvmState>,
         block_reverts: Vec<super::BlockReverts>,
         receipts: Vec<Vec<Bytes>>,
         first_block: BlockNumber,
@@ -972,12 +845,8 @@ pub(super) mod serde_bincode_compat {
     {
         fn from(value: &'a super::ExecutionOutcome<T>) -> Self {
             ExecutionOutcome {
-                state: super::serde_state::BlockStateSerde::from(value.state.inner()),
-                block_states: value
-                    .block_states
-                    .iter()
-                    .map(super::serde_state::BlockStateSerde::from)
-                    .collect(),
+                state: Cow::Borrowed(value.state.inner()),
+                block_states: value.block_states.clone(),
                 block_reverts: value.block_reverts.clone(),
                 receipts: value
                     .receipts
@@ -998,8 +867,8 @@ pub(super) mod serde_bincode_compat {
     {
         fn from(value: ExecutionOutcome<'_>) -> Self {
             Self::from_parts(
-                value.state.into(),
-                value.block_states.into_iter().map(Into::into).collect(),
+                value.state.into_owned(),
+                value.block_states,
                 value.block_reverts,
                 value
                     .receipts
