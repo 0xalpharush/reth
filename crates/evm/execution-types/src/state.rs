@@ -179,13 +179,13 @@ pub fn execution_state_from_init(
 ) -> BlockStateAccumulator {
     let mut accumulator = BlockStateAccumulator::new();
     for (address, (original, current, storage)) in accounts {
-        let original_info = original.as_ref().map(account_ref_to_info_ref);
-        let current_info = current.as_ref().map(account_ref_to_info_ref);
+        let original = original.map(account_to_info);
+        let current = current.map(account_to_info);
         accumulator
             .account(AccountChangeRef {
                 address,
-                original: original_info.as_ref(),
-                current: current_info.as_ref(),
+                original: original.as_ref(),
+                current: current.as_ref(),
                 created: false,
                 selfdestructed: false,
             })
@@ -523,7 +523,7 @@ fn account_info_ref_to_reth(info: &AccountInfo) -> Account {
     account_parts_to_reth(info.nonce, info.balance, info.code_hash)
 }
 
-fn account_ref_to_info_ref(account: &Account) -> AccountInfo {
+fn account_to_info(account: Account) -> AccountInfo {
     AccountInfo {
         balance: account.balance,
         nonce: account.nonce,
@@ -553,20 +553,10 @@ mod tests {
         AccountChangeRef { address, original, current, created: false, selfdestructed: false }
     }
 
-    fn account_info(balance: u64) -> AccountInfo {
-        AccountInfo {
-            balance: U256::from(balance),
-            nonce: 1,
-            code_hash: B256::ZERO,
-            code: None,
-            _non_exhaustive: (),
-        }
-    }
-
     #[test]
     fn deleted_account_preserves_storage_wipe_when_state_is_extended() {
         let address = Address::repeat_byte(0x01);
-        let original = account_info(1);
+        let original = AccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() };
         let mut source = BlockStateAccumulator::new();
         source.account(account_change(address, Some(&original), None)).unwrap();
         let mut aggregate = BlockStateAccumulator::new();
@@ -602,7 +592,7 @@ mod tests {
     #[test]
     fn account_created_and_deleted_across_blocks_does_not_retain_aggregate_wipe() {
         let address = Address::repeat_byte(0x03);
-        let account = account_info(1);
+        let account = AccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() };
         let mut creation = BlockStateAccumulator::new();
         creation.account(account_change(address, None, Some(&account))).unwrap();
         let mut deletion = BlockStateAccumulator::new();
@@ -652,7 +642,7 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_removes_storage_for_deleted_accounts() {
         let address = Address::repeat_byte(0x04);
-        let original = account_info(1);
+        let original = AccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() };
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();
@@ -682,7 +672,7 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_drops_wipe_for_created_accounts() {
         let address = Address::repeat_byte(0x05);
-        let current = account_info(1);
+        let current = AccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() };
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();
@@ -712,7 +702,7 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_keeps_created_account_storage_wipes_local() {
         let address = Address::repeat_byte(0x06);
-        let current = account_info(1);
+        let current = AccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() };
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();
@@ -742,8 +732,8 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_keeps_created_marker_after_account_update() {
         let address = Address::repeat_byte(0x07);
-        let current = account_info(1);
-        let updated = account_info(2);
+        let current = AccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() };
+        let updated = AccountInfo { balance: U256::from(2), nonce: 1, ..Default::default() };
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();
@@ -764,8 +754,8 @@ mod tests {
     #[test]
     fn streaming_hashed_post_state_keeps_wipe_for_existing_account_recreation() {
         let address = Address::repeat_byte(0x08);
-        let original = account_info(1);
-        let current = account_info(2);
+        let original = AccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() };
+        let current = AccountInfo { balance: U256::from(2), nonce: 1, ..Default::default() };
 
         let mut accumulator = BlockStateAccumulator::new();
         let mut sink = HashedPostStateSink::<KeccakKeyHasher>::default();

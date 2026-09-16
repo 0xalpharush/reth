@@ -1200,7 +1200,7 @@ mod tests {
         accumulator
             .account(ExecutionAccountChangeRef {
                 address,
-                original: original.as_ref().map(account_info_ref),
+                original: original.as_ref(),
                 current: None,
                 created: false,
                 selfdestructed: false,
@@ -1208,10 +1208,6 @@ mod tests {
             .unwrap();
         accumulator.storage_wipe(address).unwrap();
         accumulator
-    }
-
-    const fn account_info_ref(info: &ExecutionAccountInfo) -> &ExecutionAccountInfo {
-        info
     }
 
     #[test]

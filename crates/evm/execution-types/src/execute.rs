@@ -270,7 +270,7 @@ mod tests {
         let wiped_address = Address::repeat_byte(0x43);
         let code_hash = B256::repeat_byte(0x24);
         let bytecode = ExecutableBytecode::new_raw(Bytes::from_static(&[0x60, 0x00]));
-        let info = AccountInfo {
+        let account = AccountInfo {
             balance: U256::from(7),
             nonce: 3,
             code_hash,
@@ -284,7 +284,7 @@ mod tests {
             .account(AccountChangeRef {
                 address,
                 original: None,
-                current: Some(&info),
+                current: Some(&account),
                 created: false,
                 selfdestructed: false,
             })
@@ -317,13 +317,7 @@ mod tests {
     #[test]
     fn indexed_block_state_makes_deleted_account_storage_wipe_explicit() {
         let address = Address::repeat_byte(0x42);
-        let original = AccountInfo {
-            balance: U256::from(1),
-            nonce: 1,
-            code_hash: B256::ZERO,
-            code: None,
-            _non_exhaustive: (),
-        };
+        let original = AccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() };
         let mut state = BlockStateAccumulator::new();
         state
             .account(AccountChangeRef {
