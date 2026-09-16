@@ -10666,6 +10666,7 @@ dependencies = [
  "reth-payload-builder-primitives",
  "reth-payload-primitives",
  "reth-primitives-traits",
+ "reth-storage-api",
  "reth-trie-parallel",
  "tokio",
  "tokio-stream",
