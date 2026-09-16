@@ -144,6 +144,7 @@ members = [
     "examples/txpool-tracing/",
     "examples/custom-beacon-withdrawals",
     "testing/ef-tests/",
+    "testing/fuzz-harness",
     "testing/testing-utils",
     "testing/runner",
     "crates/tracing-otlp",
@@ -690,4 +691,4 @@ vergen-git2 = "10.0.1"
 ipnet = "2.11"
 
 [patch."https://github.com/alloy-rs/evm2"]
-evm2 = { git = "https://github.com/alloy-rs/evm2?branch=main", rev = "3e4e0ada354143143d560e2428acfdd0d2fc8db7" }
+evm2 = { git = "https://github.com/0xalpharush/evm2", rev = "3e4e0ada354143143d560e2428acfdd0d2fc8db7" }

@@ -3594,7 +3594,7 @@ dependencies = [
 [[package]]
 name = "evm2"
 version = "0.1.0"
-source = "git+https://github.com/alloy-rs/evm2?branch=main?rev=3e4e0ada354143143d560e2428acfdd0d2fc8db7#3e4e0ada354143143d560e2428acfdd0d2fc8db7"
+source = "git+https://github.com/0xalpharush/evm2?rev=3e4e0ada354143143d560e2428acfdd0d2fc8db7#3e4e0ada354143143d560e2428acfdd0d2fc8db7"
 dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
@@ -3614,7 +3614,7 @@ dependencies = [
  "c-kzg",
  "cfg-if",
  "derive-where",
- "evm2-macros 0.1.0 (git+https://github.com/alloy-rs/evm2?branch=main?rev=3e4e0ada354143143d560e2428acfdd0d2fc8db7)",
+ "evm2-macros 0.1.0 (git+https://github.com/0xalpharush/evm2?rev=3e4e0ada354143143d560e2428acfdd0d2fc8db7)",
  "k256 0.14.0",
  "once_cell",
  "p256",
@@ -3768,7 +3768,7 @@ dependencies = [
 [[package]]
 name = "evm2-macros"
 version = "0.1.0"
-source = "git+https://github.com/alloy-rs/evm2?rev=3e4e0ada354143143d560e2428acfdd0d2fc8db7#3e4e0ada354143143d560e2428acfdd0d2fc8db7"
+source = "git+https://github.com/0xalpharush/evm2?rev=3e4e0ada354143143d560e2428acfdd0d2fc8db7#3e4e0ada354143143d560e2428acfdd0d2fc8db7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3778,7 +3778,7 @@ dependencies = [
 [[package]]
 name = "evm2-macros"
 version = "0.1.0"
-source = "git+https://github.com/alloy-rs/evm2?branch=main?rev=3e4e0ada354143143d560e2428acfdd0d2fc8db7#3e4e0ada354143143d560e2428acfdd0d2fc8db7"
+source = "git+https://github.com/alloy-rs/evm2?rev=3e4e0ada354143143d560e2428acfdd0d2fc8db7#3e4e0ada354143143d560e2428acfdd0d2fc8db7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -9318,6 +9318,31 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "reth-fuzz-harness"
+version = "2.4.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rlp",
+ "bincode",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-db-common",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-execution-types",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-trie",
+ "reth-trie-db",
+ "serde",
 ]
 
 [[package]]
