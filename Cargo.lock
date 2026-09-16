@@ -9325,11 +9325,13 @@ name = "reth-fuzz-harness"
 version = "2.4.1"
 dependencies = [
  "alloy-consensus",
+ "alloy-eip7928",
  "alloy-eips",
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "bincode",
+ "evm2",
  "reth-chainspec",
  "reth-consensus",
  "reth-db-common",
