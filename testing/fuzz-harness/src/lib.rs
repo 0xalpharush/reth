@@ -9,25 +9,35 @@ use alloy_consensus::{
     transaction::{Recovered, SignerRecoverable, Transaction},
     Block, Header, TxEnvelope,
 };
+use alloy_eip7928::compute_block_access_list_hash;
 use alloy_eips::Decodable2718;
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, Bytes, B256, B64, U256};
-use alloy_rlp::Decodable;
+use alloy_rlp::{Decodable, Encodable};
 use reth_chainspec::{Chain, ChainSpec, ChainSpecBuilder};
 use reth_consensus::{Consensus, HeaderValidator};
 use reth_db_common::init::{insert_genesis_hashes, insert_genesis_history, insert_genesis_state};
 use reth_ethereum_consensus::{validate_block_post_execution, EthBeaconConsensus};
 use reth_ethereum_primitives::{Block as EthBlock, Receipt, TransactionSigned};
-use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_evm::{
+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput, Executor},
+    ConfigureEvm, NextBlockEnvAttributes,
+};
 use reth_evm_ethereum::EthEvmConfig;
-use reth_primitives_traits::SealedHeader;
-use reth_primitives_traits::{RecoveredBlock, SealedBlock};
+use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
 use reth_provider::{
     test_utils::create_test_provider_factory_with_chain_spec, BlockWriter, DatabaseProviderFactory,
     ExecutionOutcome, HistoryWriter, OriginalValuesKnown, StateWriteConfig, StateWriter,
     StaticFileProviderFactory, StaticFileSegment, StaticFileWriter, StorageSettingsCache,
 };
-use reth_revm::database::StateProviderDatabase;
+use reth_revm::{
+    database::StateProviderDatabase,
+    db::State,
+    revm::{
+        context_interface::cfg::{gas::calculate_initial_tx_gas, gas_params::Eip2780TxInfo},
+        primitives::hardfork::SpecId,
+    },
+};
 use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
 use reth_trie_db::DatabaseStateRoot;
 use serde::{
@@ -56,7 +66,7 @@ pub type FuzzStatus = i32;
 
 pub const FUZZ_REJECT: FuzzStatus = 0;
 pub const FUZZ_ACCEPT: FuzzStatus = 1;
-pub const TYPED_HARNESS_SCHEMA_VERSION: u32 = 1;
+pub const TYPED_HARNESS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NonEmpty<T> {
@@ -186,6 +196,8 @@ pub struct EthereumTransactionInput {
     pub chain_id: u64,
     pub fork: EthFork,
     pub tx: Vec<u8>,
+    /// Sender verified by the ingress boundary. `None` asks the harness to recover it.
+    pub sender: Option<[u8; 20]>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -195,6 +207,8 @@ pub struct EthereumStateInput {
     pub pre_state: StateInput,
     pub env: BlockContextInput,
     pub tx: Vec<u8>,
+    /// Sender verified by the ingress boundary. `None` asks the harness to recover it.
+    pub sender: Option<[u8; 20]>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -203,6 +217,8 @@ pub struct EthereumBlockchainInput {
     pub fork: EthFork,
     pub genesis: GenesisSpec,
     pub blocks: NonEmpty<Vec<u8>>,
+    /// Verified transaction senders, indexed by block and transaction.
+    pub senders: Vec<Vec<[u8; 20]>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -358,9 +374,9 @@ pub unsafe extern "C" fn ethereum_fuzz_execute_with_result_v1(
     };
     let outcome = match input {
         EthereumHarnessInput::Transaction(input) => {
-            if input.chain_id == 0
-                || input.tx.is_empty()
-                || !fork_supports_tx(input.fork, &input.tx)
+            if input.chain_id == 0 ||
+                input.tx.is_empty() ||
+                !fork_supports_tx(input.fork, &input.tx)
             {
                 return FUZZ_REJECT;
             }
@@ -376,6 +392,34 @@ pub unsafe extern "C" fn ethereum_fuzz_execute_with_result_v1(
         },
     };
     let Ok(bytes) = bincode::serialize(&outcome) else {
+        return FUZZ_REJECT;
+    };
+    unsafe { write_fuzz_output(out_ptr, out_len, out_written, &bytes) }
+}
+
+/// Builds a canonical one-transaction chain using reth's production payload-building machinery.
+///
+/// The input sender is required and must already have been checked against the signature by the
+/// caller. The resulting sealed block is suitable for differential block re-execution.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ethereum_fuzz_materialize_blockchain_v1(
+    out_ptr: *mut u8,
+    out_len: usize,
+    out_written: *mut usize,
+    in_ptr: *const u8,
+    in_len: usize,
+) -> FuzzStatus {
+    if in_ptr.is_null() {
+        return FUZZ_REJECT;
+    }
+    let input = unsafe { std::slice::from_raw_parts(in_ptr, in_len) };
+    let Ok(input) = bincode::deserialize::<EthereumStateInput>(input) else {
+        return FUZZ_REJECT;
+    };
+    let Some(output) = materialize_blockchain(input) else {
+        return FUZZ_REJECT;
+    };
+    let Ok(bytes) = bincode::serialize(&output) else {
         return FUZZ_REJECT;
     };
     unsafe { write_fuzz_output(out_ptr, out_len, out_written, &bytes) }
@@ -410,6 +454,7 @@ pub unsafe extern "C" fn ethereum_fuzz_capabilities_v1(
             EthFork::Cancun,
             EthFork::Prague,
             EthFork::Osaka,
+            EthFork::Amsterdam,
         ])
         .expect("reth harness advertises at least one fork"),
         supported_inputs: NonEmpty::new(vec![
@@ -427,14 +472,14 @@ pub unsafe extern "C" fn ethereum_fuzz_capabilities_v1(
 
 fn execute_transaction(input: EthereumTransactionInput) -> TransactionOutcome {
     match TxEnvelope::decode_2718_exact(input.tx.as_slice()) {
-        Ok(tx) => match tx.recover_signer() {
-            Ok(sender) => TransactionOutcome {
+        Ok(tx) => match input.sender.map(Address::new).or_else(|| tx.recover_signer().ok()) {
+            Some(sender) => TransactionOutcome {
                 error: ErrorClass::None,
                 sender: Some(sender.into_array()),
                 tx_type: Some(tx.tx_type() as u8),
-                intrinsic_gas: Some(intrinsic_gas(input.fork, &tx)),
+                intrinsic_gas: Some(intrinsic_gas(input.fork, sender, &tx)),
             },
-            Err(_) => TransactionOutcome {
+            None => TransactionOutcome {
                 error: ErrorClass::RlpDecode,
                 tx_type: Some(tx.tx_type() as u8),
                 ..TransactionOutcome::default()
@@ -446,11 +491,79 @@ fn execute_transaction(input: EthereumTransactionInput) -> TransactionOutcome {
     }
 }
 
+fn materialize_blockchain(input: EthereumStateInput) -> Option<EthereumBlockchainInput> {
+    if input.chain_id == 0 || input.tx.is_empty() || !fork_supports_tx(input.fork, &input.tx) {
+        return None;
+    }
+    let sender = input.sender?;
+    let tx = recover_tx(&input.tx, Some(sender))?;
+    let chain_spec = chain_spec(input.chain_id, input.fork);
+    let factory = create_test_provider_factory_with_chain_spec(chain_spec.clone());
+    let provider = factory.database_provider_rw().ok()?;
+    let genesis_state = genesis_state(input.pre_state.clone());
+    insert_genesis_state(&provider, genesis_state.iter()).ok()?;
+    insert_genesis_hashes(&provider, genesis_state.iter()).ok()?;
+    insert_genesis_history(&provider, genesis_state.iter()).ok()?;
+
+    let empty_overlay = HashedPostState::default().into_sorted();
+    let genesis_state_root = reth_trie_db::with_adapter!(provider, |A| {
+        StateRoot::<reth_trie_db::DatabaseTrieCursorFactory<_, A>, _>::overlay_root(
+            provider.tx_ref(),
+            &empty_overlay,
+        )
+    })
+    .ok()?;
+
+    let mut genesis_env = input.env.clone();
+    genesis_env.block_number = 0;
+    genesis_env.timestamp = genesis_env.timestamp.saturating_sub(1);
+    let mut genesis_header =
+        state_block(input.fork, genesis_env.clone(), Vec::new())?.header().clone();
+    genesis_header.state_root = genesis_state_root;
+    let genesis_header = SealedHeader::seal_slow(genesis_header);
+
+    let state_provider = provider.latest();
+    let database = StateProviderDatabase(&state_provider);
+    let mut database = State::builder()
+        .with_database(database)
+        .with_bundle_update()
+        .with_bal_builder_if(input.fork >= EthFork::Amsterdam)
+        .build();
+    let evm_config = EthEvmConfig::ethereum(chain_spec);
+    let attributes = NextBlockEnvAttributes {
+        timestamp: input.env.timestamp.max(genesis_header.timestamp.saturating_add(1)),
+        suggested_fee_recipient: Address::new(input.env.beneficiary),
+        prev_randao: B256::ZERO,
+        gas_limit: input.env.gas_limit,
+        parent_beacon_block_root: (input.fork >= EthFork::Cancun).then_some(B256::ZERO),
+        withdrawals: (input.fork >= EthFork::Shanghai).then(Default::default),
+        extra_data: Bytes::new(),
+        slot_number: (input.fork >= EthFork::Amsterdam).then_some(1),
+    };
+    let mut builder =
+        evm_config.builder_for_next_block(&mut database, &genesis_header, attributes).ok()?;
+    builder.apply_pre_execution_changes().ok()?;
+    builder.execute_transaction(tx).ok()?;
+    let BlockBuilderOutcome { block, .. } = builder.finish(&state_provider, None).ok()?;
+
+    let mut header_rlp = Vec::new();
+    genesis_header.header().encode(&mut header_rlp);
+    let mut sealed_block = Vec::new();
+    block.into_sealed_block().encode(&mut sealed_block);
+    Some(EthereumBlockchainInput {
+        chain_id: input.chain_id,
+        fork: input.fork,
+        genesis: GenesisSpec { alloc: input.pre_state, env: genesis_env, header_rlp },
+        blocks: NonEmpty::new(vec![sealed_block]).ok()?,
+        senders: vec![vec![sender]],
+    })
+}
+
 fn execute_state(input: EthereumStateInput) -> Option<EthereumExecutionOutcome> {
     if input.chain_id == 0 || input.tx.is_empty() || !fork_supports_tx(input.fork, &input.tx) {
         return None;
     }
-    let tx = recover_tx(&input.tx)?;
+    let tx = recover_tx(&input.tx, input.sender)?;
     let diagnostic_addresses =
         state_diagnostic_addresses(&input.pre_state, input.env.beneficiary, &tx);
     let chain_spec = chain_spec(input.chain_id, input.fork);
@@ -521,7 +634,8 @@ fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutio
     let mut final_state_root = None;
 
     for (block_index, sealed) in input.blocks.items.iter().enumerate() {
-        let block = decode_recovered_block(sealed)?;
+        let senders = input.senders.get(block_index).map(Vec::as_slice);
+        let block = decode_recovered_block(sealed, senders)?;
         let effective_gas_prices = block
             .body()
             .transactions()
@@ -542,8 +656,9 @@ fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutio
 
         let state_provider = provider.latest();
         let database = StateProviderDatabase(&state_provider);
-        let output = match executor_provider.batch_executor(database).execute(&block) {
-            Ok(output) => output,
+        let mut executor = executor_provider.batch_executor(database);
+        let result = match executor.execute_one(&block) {
+            Ok(result) => result,
             Err(_) => {
                 return Some(execution_outcome(
                     ErrorClass::Rejected,
@@ -554,8 +669,20 @@ fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutio
                 ))
             }
         };
+        let block_access_list_hash =
+            executor.take_bal().as_deref().map(compute_block_access_list_hash);
+        let mut state = executor.into_state();
+        let output = BlockExecutionOutput { state: state.take_bundle(), result };
 
-        if validate_block_post_execution(&block, &chain_spec, &output, None, None).is_err() {
+        if validate_block_post_execution(
+            &block,
+            &chain_spec,
+            &output.result,
+            None,
+            block_access_list_hash,
+        )
+        .is_err()
+        {
             return Some(execution_outcome(
                 ErrorClass::Rejected,
                 block_index as u64,
@@ -606,7 +733,7 @@ fn execute_blockchain(input: EthereumBlockchainInput) -> Option<EthereumExecutio
     })
 }
 
-fn intrinsic_gas(fork: EthFork, tx: &TxEnvelope) -> u64 {
+fn intrinsic_gas(fork: EthFork, sender: Address, tx: &TxEnvelope) -> u64 {
     let (access_list_accounts, access_list_storages) = match tx.access_list() {
         Some(list) => (
             list.0.len() as u64,
@@ -619,21 +746,18 @@ fn intrinsic_gas(fork: EthFork, tx: &TxEnvelope) -> u64 {
         None => 0,
     };
 
-    let non_zero_calldata_cost = if fork >= EthFork::Istanbul { 16 } else { 68 };
-    let calldata_gas = tx
-        .input()
-        .iter()
-        .fold(0u64, |gas, byte| gas + if *byte == 0 { 4 } else { non_zero_calldata_cost });
-    let create_gas = if tx.is_create() && fork >= EthFork::Homestead { 32_000 } else { 0 };
-    let initcode_gas = if tx.is_create() && fork >= EthFork::Shanghai {
-        2 * div_ceil(tx.input().len() as u64, 32)
-    } else {
-        0
-    };
-    let access_list_gas = access_list_accounts * 2_400 + access_list_storages * 1_900;
-    let authorization_gas = authorization_list_num * 25_000;
-
-    21_000 + calldata_gas + create_gas + initcode_gas + access_list_gas + authorization_gas
+    let eip2780 = (fork >= EthFork::Amsterdam)
+        .then_some(Eip2780TxInfo { value: tx.value(), is_self_transfer: tx.to() == Some(sender) });
+    calculate_initial_tx_gas(
+        revm_spec_id(fork),
+        tx.input(),
+        tx.is_create(),
+        access_list_accounts,
+        access_list_storages,
+        authorization_list_num,
+        eip2780,
+    )
+    .initial_total_gas()
 }
 
 fn fork_supports_tx(fork: EthFork, tx: &[u8]) -> bool {
@@ -648,17 +772,9 @@ fn fork_supports_tx(fork: EthFork, tx: &[u8]) -> bool {
     }
 }
 
-fn div_ceil(value: u64, divisor: u64) -> u64 {
-    if value == 0 {
-        0
-    } else {
-        1 + (value - 1) / divisor
-    }
-}
-
-fn recover_tx(bytes: &[u8]) -> Option<Recovered<TransactionSigned>> {
+fn recover_tx(bytes: &[u8], sender: Option<[u8; 20]>) -> Option<Recovered<TransactionSigned>> {
     let tx = TransactionSigned::decode_2718_exact(bytes).ok()?;
-    let signer = tx.recover_signer().ok()?;
+    let signer = sender.map(Address::new).or_else(|| tx.recover_signer().ok())?;
     Some(Recovered::new_unchecked(tx, signer))
 }
 
@@ -666,8 +782,39 @@ fn decode_header(bytes: &[u8]) -> Option<Header> {
     Header::decode(&mut &bytes[..]).ok()
 }
 
-fn decode_recovered_block(bytes: &[u8]) -> Option<RecoveredBlock<EthBlock>> {
-    SealedBlock::<EthBlock>::decode(&mut &bytes[..]).ok()?.try_recover().ok()
+fn decode_recovered_block(
+    bytes: &[u8],
+    senders: Option<&[[u8; 20]]>,
+) -> Option<RecoveredBlock<EthBlock>> {
+    let sealed = SealedBlock::<EthBlock>::decode(&mut &bytes[..]).ok()?;
+    match senders {
+        Some(senders) if senders.len() == sealed.body().transactions.len() => {
+            let senders = senders.iter().copied().map(Address::new).collect();
+            Some(RecoveredBlock::new_sealed(sealed, senders))
+        }
+        None => sealed.try_recover().ok(),
+        Some(_) => None,
+    }
+}
+
+const fn revm_spec_id(fork: EthFork) -> SpecId {
+    match fork {
+        EthFork::Frontier => SpecId::FRONTIER,
+        EthFork::Homestead => SpecId::HOMESTEAD,
+        EthFork::Tangerine => SpecId::TANGERINE,
+        EthFork::SpuriousDragon => SpecId::SPURIOUS_DRAGON,
+        EthFork::Byzantium => SpecId::BYZANTIUM,
+        EthFork::Constantinople | EthFork::Petersburg => SpecId::PETERSBURG,
+        EthFork::Istanbul => SpecId::ISTANBUL,
+        EthFork::Berlin => SpecId::BERLIN,
+        EthFork::London => SpecId::LONDON,
+        EthFork::Paris => SpecId::MERGE,
+        EthFork::Shanghai => SpecId::SHANGHAI,
+        EthFork::Cancun => SpecId::CANCUN,
+        EthFork::Prague => SpecId::PRAGUE,
+        EthFork::Osaka => SpecId::OSAKA,
+        EthFork::Amsterdam => SpecId::AMSTERDAM,
+    }
 }
 
 fn chain_spec(chain_id: u64, fork: EthFork) -> Arc<ChainSpec> {
@@ -748,7 +895,7 @@ fn state_block(
         parent_beacon_block_root,
         requests_hash: (fork >= EthFork::Prague).then_some(EMPTY_ROOT_HASH),
         block_access_list_hash: (fork >= EthFork::Amsterdam).then_some(EMPTY_OMMER_ROOT_HASH),
-        slot_number: None,
+        slot_number: (fork >= EthFork::Amsterdam).then_some(env.block_number),
     };
     Some(RecoveredBlock::from(Block::from_transactions(header, transactions)))
 }
@@ -908,6 +1055,28 @@ unsafe fn write_fuzz_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{SignableTransaction, TxLegacy};
+    use alloy_eips::Encodable2718;
+    use alloy_primitives::{Signature, TxKind};
+
+    const ALL_FORKS: [EthFork; 16] = [
+        EthFork::Frontier,
+        EthFork::Homestead,
+        EthFork::Tangerine,
+        EthFork::SpuriousDragon,
+        EthFork::Byzantium,
+        EthFork::Constantinople,
+        EthFork::Petersburg,
+        EthFork::Istanbul,
+        EthFork::Berlin,
+        EthFork::London,
+        EthFork::Paris,
+        EthFork::Shanghai,
+        EthFork::Cancun,
+        EthFork::Prague,
+        EthFork::Osaka,
+        EthFork::Amsterdam,
+    ];
 
     #[test]
     fn capabilities_advertise_all_unified_ethereum_inputs() {
@@ -951,6 +1120,7 @@ mod tests {
                 hardfork: EthFork::Cancun as u8,
             },
             tx: vec![0xc0],
+            sender: None,
         });
         let input = bincode::serialize(&state).expect("state input serializes");
         let mut output = vec![0; 4096];
@@ -986,6 +1156,7 @@ mod tests {
                 header_rlp: Vec::new(),
             },
             blocks: NonEmpty::new(vec![vec![0xc0]]).expect("one block"),
+            senders: Vec::new(),
         });
         let input = bincode::serialize(&blockchain).expect("blockchain input serializes");
         let mut output = vec![0; 4096];
@@ -1000,5 +1171,56 @@ mod tests {
             )
         };
         assert_eq!(status, FUZZ_REJECT);
+    }
+
+    #[test]
+    fn production_builder_materializes_replayable_transaction_block_for_every_fork() {
+        let tx: TxEnvelope = TxLegacy {
+            chain_id: None,
+            nonce: 0,
+            gas_price: 1_000_000_000_000,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::repeat_byte(0x42)),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        }
+        .into_signed(Signature::test_signature())
+        .into();
+        let sender = tx.recover_signer().expect("test signature recovers");
+        let mut tx_bytes = Vec::new();
+        tx.encode_2718(&mut tx_bytes);
+
+        for fork in ALL_FORKS {
+            let input = EthereumStateInput {
+                chain_id: 1,
+                fork,
+                pre_state: StateInput {
+                    accounts: vec![AccountInput {
+                        address: sender.into_array(),
+                        balance: U256::from(1_000_000_000_000_000_000u128).to_be_bytes(),
+                        nonce: 0,
+                        code: Vec::new(),
+                        storage: Vec::new(),
+                    }],
+                },
+                env: BlockContextInput {
+                    block_number: 1,
+                    timestamp: 2,
+                    timestamp_millis_part: 0,
+                    basefee: 1_000_000_000,
+                    gas_limit: 30_000_000,
+                    beneficiary: Address::repeat_byte(0x43).into_array(),
+                    hardfork: fork as u8,
+                },
+                tx: tx_bytes.clone(),
+                sender: Some(sender.into_array()),
+            };
+            let blockchain = materialize_blockchain(input)
+                .unwrap_or_else(|| panic!("production builder rejected {fork:?}"));
+            let outcome = execute_blockchain(blockchain)
+                .unwrap_or_else(|| panic!("replay rejected materialized {fork:?}"));
+            assert_eq!(outcome.error, ErrorClass::None, "fork {fork:?}");
+            assert_eq!(outcome.receipts.len(), 1, "fork {fork:?}");
+        }
     }
 }

@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 alloy-consensus = { workspace = true, features = ["secp256k1"] }
+alloy-eip7928.workspace = true
 alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true

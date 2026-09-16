@@ -9202,6 +9202,7 @@ name = "reth-fuzz-harness"
 version = "2.5.2"
 dependencies = [
  "alloy-consensus",
+ "alloy-eip7928",
  "alloy-eips",
  "alloy-genesis",
  "alloy-primitives",
