@@ -20,7 +20,7 @@ use reth_chain_state::CanonStateNotification;
 use reth_execution_cache::SavedCache;
 use reth_payload_builder::{
     BuildNewPayload, KeepPayloadJobAlive, PayloadBuilderLease, PayloadId, PayloadJob,
-    PayloadJobGenerator,
+    PayloadJobGenerator, PayloadStateProviderFactory,
 };
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuiltPayload, PayloadAttributes, PayloadKind};
@@ -222,6 +222,7 @@ where
             cached_reads,
             execution_cache: resources.take_execution_cache(),
             state_root_handle: resources.take_state_root_handle(),
+            state_provider_factory: resources.take_state_provider_factory(),
             leases: resources.take_leases(),
             payload_task_guard: self.payload_task_guard.clone(),
             metrics: Default::default(),
@@ -413,6 +414,8 @@ where
     execution_cache: Option<SavedCache>,
     /// Optional state-root task handle, shared with the engine.
     state_root_handle: Option<PayloadStateRootHandle>,
+    /// Factory for state pinned when the engine accepted this job.
+    state_provider_factory: Option<PayloadStateProviderFactory>,
     /// Lifecycle leases shared with the payload-builder service.
     ///
     /// Every detached build task clones these so that the loaned resources remain available until
@@ -432,6 +435,20 @@ where
     Builder::Attributes: Unpin + Clone,
     Builder::BuiltPayload: Unpin + Clone,
 {
+    fn empty_payload_arguments(
+        &self,
+    ) -> BuildArguments<Builder::Attributes, Builder::BuiltPayload> {
+        BuildArguments {
+            cached_reads: Default::default(),
+            execution_cache: self.execution_cache.clone(),
+            state_root_handle: None,
+            state_provider_factory: self.state_provider_factory.clone(),
+            config: self.config.clone(),
+            cancel: CancelOnDrop::default(),
+            best_payload: None,
+        }
+    }
+
     /// Spawns a new payload build task.
     fn spawn_build_job(&mut self) {
         trace!(target: "payload_builder", id = %self.config.payload_id(), "spawn new payload build task");
@@ -445,6 +462,7 @@ where
         let cached_reads = self.cached_reads.take().unwrap_or_default();
         let execution_cache = self.execution_cache.clone();
         let state_root_handle = self.state_root_handle.take();
+        let state_provider_factory = self.state_provider_factory.clone();
         let leases = self.leases.clone();
         let builder = self.builder.clone();
         let executor = self.executor.clone();
@@ -457,6 +475,7 @@ where
                     cached_reads,
                     execution_cache,
                     state_root_handle,
+                    state_provider_factory,
                     config: payload_config,
                     cancel,
                     best_payload,
@@ -562,7 +581,7 @@ where
             // started right away and the first full block should have been
             // built by the time CL is requesting the payload.
             self.metrics.inc_requested_empty_payload();
-            self.builder.build_empty_payload(self.config.clone())
+            self.builder.build_empty_payload_with_args(self.empty_payload_arguments())
         }
     }
 
@@ -598,6 +617,7 @@ where
                 cached_reads: self.cached_reads.take().unwrap_or_default(),
                 execution_cache: self.execution_cache.clone(),
                 state_root_handle: None,
+                state_provider_factory: self.state_provider_factory.clone(),
                 config: self.config.clone(),
                 cancel: CancelOnDrop::default(),
                 best_payload: None,
@@ -614,13 +634,13 @@ where
                     self.metrics.inc_requested_empty_payload();
                     // no payload built yet, so we need to return an empty payload
                     let (tx, rx) = oneshot::channel();
-                    let config = self.config.clone();
+                    let args = self.empty_payload_arguments();
                     let builder = self.builder.clone();
                     let leases = self.leases.clone();
                     drop(self.executor.spawn_named_or_blocking(
                         PAYLOAD_BUILDER_THREAD_NAME,
                         move || {
-                            let res = builder.build_empty_payload(config);
+                            let res = builder.build_empty_payload_with_args(args);
                             drop(leases);
                             let _ = tx.send(res);
                         },
@@ -963,6 +983,8 @@ pub struct BuildArguments<Attributes, Payload: BuiltPayload> {
     /// root, so if the next `newPayload` is not on top of that block, the trie cache is
     /// invalidated and cleared.
     pub state_root_handle: Option<PayloadStateRootHandle>,
+    /// Factory for state pinned to the payload's parent.
+    pub state_provider_factory: Option<PayloadStateProviderFactory>,
     /// How to configure the payload.
     pub config: PayloadConfig<Attributes, HeaderTy<Payload::Primitives>>,
     /// A marker that can be used to cancel the job.
@@ -981,7 +1003,15 @@ impl<Attributes, Payload: BuiltPayload> BuildArguments<Attributes, Payload> {
         cancel: CancelOnDrop,
         best_payload: Option<Payload>,
     ) -> Self {
-        Self { cached_reads, execution_cache, state_root_handle, config, cancel, best_payload }
+        Self {
+            cached_reads,
+            execution_cache,
+            state_root_handle,
+            state_provider_factory: None,
+            config,
+            cancel,
+            best_payload,
+        }
     }
 }
 
@@ -1031,6 +1061,14 @@ pub trait PayloadBuilder: Send + Sync + Clone {
         &self,
         config: PayloadConfig<Self::Attributes, HeaderForPayload<Self::BuiltPayload>>,
     ) -> Result<Self::BuiltPayload, PayloadBuilderError>;
+
+    /// Builds an empty payload with the resources captured for its payload job.
+    fn build_empty_payload_with_args(
+        &self,
+        args: BuildArguments<Self::Attributes, Self::BuiltPayload>,
+    ) -> Result<Self::BuiltPayload, PayloadBuilderError> {
+        self.build_empty_payload(args.config)
+    }
 }
 
 /// Tells the payload builder how to react to payload request if there's no payload available yet.

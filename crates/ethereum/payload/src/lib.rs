@@ -125,6 +125,13 @@ where
             None,
         );
 
+        self.build_empty_payload_with_args(args)
+    }
+
+    fn build_empty_payload_with_args(
+        &self,
+        args: BuildArguments<Self::Attributes, Self::BuiltPayload>,
+    ) -> Result<EthBuiltPayload, PayloadBuilderError> {
         default_ethereum_payload(
             self.evm_config.clone(),
             self.client.clone(),
@@ -162,6 +169,7 @@ where
         mut cached_reads,
         execution_cache,
         mut state_root_handle,
+        state_provider_factory,
         config,
         cancel,
         best_payload,
@@ -169,7 +177,11 @@ where
     let PayloadConfig { parent_header, attributes, payload_id, .. } = config;
     let skip_state_root = builder_config.skip_state_root;
 
-    let mut state_provider = client.state_by_block_hash(parent_header.hash())?;
+    let mut state_provider = if let Some(factory) = state_provider_factory {
+        factory.state_provider()?
+    } else {
+        client.state_by_block_hash(parent_header.hash())?
+    };
     if let Some(execution_cache) = execution_cache {
         state_provider = Box::new(CachedStateProvider::new(
             state_provider,
