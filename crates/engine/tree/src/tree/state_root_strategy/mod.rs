@@ -724,6 +724,7 @@ impl DefaultStateRootStrategy {
             let pending_trie = if let Some(result) = &task_result {
                 let preserved_anchor_hash = published_sparse_trie_anchor_hash(
                     sparse_trie_anchor_hash,
+                    parent_hash,
                     reused_preserved_sparse_trie,
                     pending_sparse_trie_prune_blocks.as_deref(),
                 );
@@ -877,6 +878,7 @@ impl DefaultStateRootStrategy {
                 }
                 let anchor_hash = published_sparse_trie_anchor_hash(
                     anchor_hash,
+                    parent_hash,
                     reused,
                     pending_sparse_trie_prune_blocks.as_deref(),
                 );
@@ -931,6 +933,7 @@ fn sparse_trie_prune_before<N: NodePrimitives>(
 
 fn published_sparse_trie_anchor_hash<N: NodePrimitives>(
     sparse_trie_anchor_hash: B256,
+    parent_hash: B256,
     reused_preserved_sparse_trie: bool,
     pending_sparse_trie_prune_blocks: Option<&[ExecutedBlock<N>]>,
 ) -> B256 {
@@ -941,7 +944,7 @@ fn published_sparse_trie_anchor_hash<N: NodePrimitives>(
     let Some(prune_blocks) = pending_sparse_trie_prune_blocks else {
         return sparse_trie_anchor_hash
     };
-    let Some(oldest_prune_block) = prune_blocks.last() else { return sparse_trie_anchor_hash };
+    let Some(oldest_prune_block) = prune_blocks.last() else { return parent_hash };
 
     // Prune blocks contain the complete in-memory parent chain from newest to oldest, with the
     // oldest block's parent being the persisted tip. A fresh trie can be anchored to an in-memory
@@ -1589,7 +1592,12 @@ mod tests {
         let prune_blocks: Vec<_> = blocks.into_iter().skip(2).rev().collect();
 
         assert_eq!(
-            published_sparse_trie_anchor_hash(reused_anchor_hash, true, Some(&prune_blocks)),
+            published_sparse_trie_anchor_hash(
+                reused_anchor_hash,
+                B256::with_last_byte(0xbb),
+                true,
+                Some(&prune_blocks),
+            ),
             expected_prune_anchor
         );
     }
@@ -1604,8 +1612,29 @@ mod tests {
 
         assert_ne!(reused_anchor_hash, prune_anchor);
         assert_eq!(
-            published_sparse_trie_anchor_hash(reused_anchor_hash, true, Some(&prune_blocks)),
+            published_sparse_trie_anchor_hash(
+                reused_anchor_hash,
+                B256::with_last_byte(0xbb),
+                true,
+                Some(&prune_blocks),
+            ),
             reused_anchor_hash
+        );
+    }
+
+    #[test]
+    fn published_sparse_trie_anchor_advances_to_parent_when_pruning_all_old_epochs() {
+        let reused_anchor_hash = B256::with_last_byte(0xaa);
+        let parent_hash = B256::with_last_byte(0xbb);
+
+        assert_eq!(
+            published_sparse_trie_anchor_hash::<EthPrimitives>(
+                reused_anchor_hash,
+                parent_hash,
+                true,
+                Some(&[]),
+            ),
+            parent_hash
         );
     }
 
@@ -1616,7 +1645,7 @@ mod tests {
         let parent_hash = B256::with_last_byte(0xaa);
 
         assert_eq!(
-            published_sparse_trie_anchor_hash(parent_hash, false, Some(&blocks)),
+            published_sparse_trie_anchor_hash(parent_hash, parent_hash, false, Some(&blocks)),
             parent_hash
         );
     }
