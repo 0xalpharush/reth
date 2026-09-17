@@ -1088,7 +1088,7 @@ mod tests {
             evm_config: EthEvmConfig::new(chain),
             saved_cache: Some(SavedCache::new(
                 parent_hash,
-                crate::tree::ExecutionCache::new_deterministic(1_000_000),
+                crate::tree::ExecutionCache::new(1_000_000),
             )),
             provider: OverlayStateProviderFactory::new(
                 provider,
@@ -1337,6 +1337,7 @@ mod tests {
             precompile_cache_map: PrecompileCacheMap::default(),
             disable_bal_parallel_state_root: false,
             disable_bal_batch_io: false,
+            cooperative_transactions: None,
         }
     }
 
